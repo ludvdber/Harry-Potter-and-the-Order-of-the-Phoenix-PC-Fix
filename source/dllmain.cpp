@@ -18,9 +18,21 @@
 #include "d3dx9.h"
 #include "iathook.h"
 #include "helpers.h"
+#include <cstdio>
 
 #pragma comment(lib, "d3dx9.lib")
 #pragma comment(lib, "winmm.lib") // needed for timeBeginPeriod()/timeEndPeriod()
+
+static FILE* g_log = nullptr;
+void WrapperLog(const char* fmt, ...)
+{
+	if (!g_log) return;
+	va_list args;
+	va_start(args, fmt);
+	vfprintf(g_log, fmt, args);
+	va_end(args);
+	fflush(g_log);
+}
 
 Direct3DShaderValidatorCreate9Proc m_pDirect3DShaderValidatorCreate9;
 PSGPErrorProc m_pPSGPError;
@@ -54,6 +66,15 @@ bool bCaptureMouse;
 float fFPSLimit;
 int nFullScreenRefreshRateInHz;
 int nForceWindowStyle;
+int nAntialiasing;
+int nAnisotropicFiltering;
+bool bVSync;
+float fTextureLODBias;
+int nResolutionWidth;
+int nResolutionHeight;
+int nBackBufferWidth = 0;
+int nBackBufferHeight = 0;
+bool bFXAA;
 
 char WinDir[MAX_PATH + 1];
 
@@ -225,6 +246,8 @@ private:
 
 FrameLimiter::FPSLimitMode mFPSLimitMode = FrameLimiter::FPSLimitMode::FPS_NONE;
 
+extern void DeviceFXAAPresent(IDirect3DDevice9* dev);
+
 HRESULT m_IDirect3DDevice9Ex::Present(CONST RECT* pSourceRect, CONST RECT* pDestRect, HWND hDestWindowOverride, CONST RGNDATA* pDirtyRegion)
 {
 	if (mFPSLimitMode == FrameLimiter::FPSLimitMode::FPS_REALTIME)
@@ -232,6 +255,7 @@ HRESULT m_IDirect3DDevice9Ex::Present(CONST RECT* pSourceRect, CONST RECT* pDest
 	else if (mFPSLimitMode == FrameLimiter::FPSLimitMode::FPS_ACCURATE)
 		while (!FrameLimiter::Sync_SLP());
 
+	DeviceFXAAPresent(ProxyInterface);
 	return ProxyInterface->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
 }
 
@@ -242,6 +266,7 @@ HRESULT m_IDirect3DDevice9Ex::PresentEx(THIS_ CONST RECT* pSourceRect, CONST REC
 	else if (mFPSLimitMode == FrameLimiter::FPSLimitMode::FPS_ACCURATE)
 		while (!FrameLimiter::Sync_SLP());
 
+	DeviceFXAAPresent(ProxyInterface);
 	return ProxyInterface->PresentEx(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, dwFlags);
 }
 
@@ -414,6 +439,74 @@ void ForceFullScreenRefreshRateInHz(D3DPRESENT_PARAMETERS* pPresentationParamete
 	}
 }
 
+void ApplyGraphicsSettings(D3DPRESENT_PARAMETERS* pPresentationParameters)
+{
+	if (!pPresentationParameters)
+		return;
+
+	WrapperLog("ApplyGraphicsSettings: game requested %ux%u Windowed=%d\n",
+		pPresentationParameters->BackBufferWidth, pPresentationParameters->BackBufferHeight,
+		pPresentationParameters->Windowed);
+
+	if (nResolutionWidth > 0 && nResolutionHeight > 0)
+	{
+		pPresentationParameters->BackBufferWidth = nResolutionWidth;
+		pPresentationParameters->BackBufferHeight = nResolutionHeight;
+		WrapperLog("ApplyGraphicsSettings: overriding resolution to %dx%d\n", nResolutionWidth, nResolutionHeight);
+	}
+	nBackBufferWidth  = (int)pPresentationParameters->BackBufferWidth;
+	nBackBufferHeight = (int)pPresentationParameters->BackBufferHeight;
+
+	if (nAntialiasing > 0)
+	{
+		pPresentationParameters->MultiSampleType = (D3DMULTISAMPLE_TYPE)nAntialiasing;
+		pPresentationParameters->MultiSampleQuality = 0;
+		// MSAA requires D3DSWAPEFFECT_DISCARD
+		pPresentationParameters->SwapEffect = D3DSWAPEFFECT_DISCARD;
+	}
+
+	if (bVSync)
+	{
+		pPresentationParameters->PresentationInterval = D3DPRESENT_INTERVAL_ONE;
+	}
+}
+
+// Validate MSAA against the GPU. If unsupported, downgrade silently to D3DMULTISAMPLE_NONE
+// so CreateDevice/Reset doesn't fail. Returns true if a downgrade occurred.
+bool ValidateMSAASupport(IDirect3D9* pD3D9, UINT Adapter, D3DDEVTYPE DeviceType, D3DPRESENT_PARAMETERS* pPresentationParameters)
+{
+	if (!pD3D9 || !pPresentationParameters || pPresentationParameters->MultiSampleType == D3DMULTISAMPLE_NONE)
+		return false;
+
+	D3DFORMAT bbFormat = pPresentationParameters->BackBufferFormat;
+	if (bbFormat == D3DFMT_UNKNOWN)
+		bbFormat = D3DFMT_X8R8G8B8;
+
+	HRESULT hr = pD3D9->CheckDeviceMultiSampleType(
+		Adapter, DeviceType, bbFormat,
+		pPresentationParameters->Windowed,
+		pPresentationParameters->MultiSampleType, NULL);
+
+	if (SUCCEEDED(hr) && pPresentationParameters->EnableAutoDepthStencil)
+	{
+		hr = pD3D9->CheckDeviceMultiSampleType(
+			Adapter, DeviceType, pPresentationParameters->AutoDepthStencilFormat,
+			pPresentationParameters->Windowed,
+			pPresentationParameters->MultiSampleType, NULL);
+	}
+
+	if (FAILED(hr))
+	{
+		WrapperLog("ValidateMSAASupport: MSAA %d not supported, disabling\n", (int)pPresentationParameters->MultiSampleType);
+		pPresentationParameters->MultiSampleType = D3DMULTISAMPLE_NONE;
+		pPresentationParameters->MultiSampleQuality = 0;
+		return true;
+	}
+
+	WrapperLog("ValidateMSAASupport: MSAA %d OK\n", (int)pPresentationParameters->MultiSampleType);
+	return false;
+}
+
 HRESULT m_IDirect3D9Ex::CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType, HWND hFocusWindow, DWORD BehaviorFlags, D3DPRESENT_PARAMETERS* pPresentationParameters, IDirect3DDevice9** ppReturnedDeviceInterface)
 {
 	g_hFocusWindow = hFocusWindow ? hFocusWindow : pPresentationParameters->hDeviceWindow;
@@ -424,6 +517,9 @@ HRESULT m_IDirect3D9Ex::CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType, HWND h
 
 	if (nFullScreenRefreshRateInHz)
 		ForceFullScreenRefreshRateInHz(pPresentationParameters);
+
+	ApplyGraphicsSettings(pPresentationParameters);
+	ValidateMSAASupport(ProxyInterface, Adapter, DeviceType, pPresentationParameters);
 
 	if (bDisplayFPSCounter)
 	{
@@ -437,6 +533,13 @@ HRESULT m_IDirect3D9Ex::CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType, HWND h
 
 	HRESULT hr = ProxyInterface->CreateDevice(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, ppReturnedDeviceInterface);
 
+	if (FAILED(hr) && pPresentationParameters && pPresentationParameters->MultiSampleType != D3DMULTISAMPLE_NONE)
+	{
+		pPresentationParameters->MultiSampleType = D3DMULTISAMPLE_NONE;
+		pPresentationParameters->MultiSampleQuality = 0;
+		hr = ProxyInterface->CreateDevice(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, ppReturnedDeviceInterface);
+	}
+
 	if (SUCCEEDED(hr) && ppReturnedDeviceInterface)
 	{
 		*ppReturnedDeviceInterface = new m_IDirect3DDevice9Ex((IDirect3DDevice9Ex*)*ppReturnedDeviceInterface, this, IID_IDirect3DDevice9);
@@ -445,13 +548,19 @@ HRESULT m_IDirect3D9Ex::CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType, HWND h
 	return hr;
 }
 
+extern void FreeFXAA();
+
 HRESULT m_IDirect3DDevice9Ex::Reset(D3DPRESENT_PARAMETERS* pPresentationParameters)
 {
+	FreeFXAA();
+
 	if (bForceWindowedMode)
 		ForceWindowed(pPresentationParameters);
 
 	if (nFullScreenRefreshRateInHz)
 		ForceFullScreenRefreshRateInHz(pPresentationParameters);
+
+	ApplyGraphicsSettings(pPresentationParameters);
 
 	if (bDisplayFPSCounter)
 	{
@@ -462,6 +571,13 @@ HRESULT m_IDirect3DDevice9Ex::Reset(D3DPRESENT_PARAMETERS* pPresentationParamete
 	}
 
 	auto hRet = ProxyInterface->Reset(pPresentationParameters);
+
+	if (FAILED(hRet) && pPresentationParameters && pPresentationParameters->MultiSampleType != D3DMULTISAMPLE_NONE)
+	{
+		pPresentationParameters->MultiSampleType = D3DMULTISAMPLE_NONE;
+		pPresentationParameters->MultiSampleQuality = 0;
+		hRet = ProxyInterface->Reset(pPresentationParameters);
+	}
 
 	if (bDisplayFPSCounter)
 	{
@@ -488,6 +604,9 @@ HRESULT m_IDirect3D9Ex::CreateDeviceEx(THIS_ UINT Adapter, D3DDEVTYPE DeviceType
 	if (nFullScreenRefreshRateInHz)
 		ForceFullScreenRefreshRateInHz(pPresentationParameters);
 
+	ApplyGraphicsSettings(pPresentationParameters);
+	ValidateMSAASupport(ProxyInterface, Adapter, DeviceType, pPresentationParameters);
+
 	if (bDisplayFPSCounter)
 	{
 		if (FrameLimiter::pFPSFont)
@@ -499,6 +618,13 @@ HRESULT m_IDirect3D9Ex::CreateDeviceEx(THIS_ UINT Adapter, D3DDEVTYPE DeviceType
 	}
 
 	HRESULT hr = ProxyInterface->CreateDeviceEx(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, pFullscreenDisplayMode, ppReturnedDeviceInterface);
+
+	if (FAILED(hr) && pPresentationParameters && pPresentationParameters->MultiSampleType != D3DMULTISAMPLE_NONE)
+	{
+		pPresentationParameters->MultiSampleType = D3DMULTISAMPLE_NONE;
+		pPresentationParameters->MultiSampleQuality = 0;
+		hr = ProxyInterface->CreateDeviceEx(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, pFullscreenDisplayMode, ppReturnedDeviceInterface);
+	}
 
 	if (SUCCEEDED(hr) && ppReturnedDeviceInterface)
 	{
@@ -516,6 +642,8 @@ HRESULT m_IDirect3DDevice9Ex::ResetEx(THIS_ D3DPRESENT_PARAMETERS* pPresentation
 	if (nFullScreenRefreshRateInHz)
 		ForceFullScreenRefreshRateInHz(pPresentationParameters);
 
+	ApplyGraphicsSettings(pPresentationParameters);
+
 	if (bDisplayFPSCounter)
 	{
 		if (FrameLimiter::pFPSFont)
@@ -525,6 +653,13 @@ HRESULT m_IDirect3DDevice9Ex::ResetEx(THIS_ D3DPRESENT_PARAMETERS* pPresentation
 	}
 
 	auto hRet = ProxyInterface->ResetEx(pPresentationParameters, pFullscreenDisplayMode);
+
+	if (FAILED(hRet) && pPresentationParameters && pPresentationParameters->MultiSampleType != D3DMULTISAMPLE_NONE)
+	{
+		pPresentationParameters->MultiSampleType = D3DMULTISAMPLE_NONE;
+		pPresentationParameters->MultiSampleQuality = 0;
+		hRet = ProxyInterface->ResetEx(pPresentationParameters, pFullscreenDisplayMode);
+	}
 
 	if (bDisplayFPSCounter)
 	{
@@ -969,11 +1104,32 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 	{
 		g_hWrapperModule = hModule;
 
-		// Load dll
+		// Open log file next to this DLL
+		{
+			char logPath[MAX_PATH];
+			GetModuleFileNameA(hModule, logPath, MAX_PATH);
+			strcpy(strrchr(logPath, '\\'), "\\d3d9_wrapper.log");
+			g_log = fopen(logPath, "w");
+			WrapperLog("d3d9 wrapper loaded\n");
+		}
+
+		// Load dll — try d3d9_original.dll (Chip-Biscuit's patched binary) first,
+		// fall back to the system d3d9.dll if not present.
 		char path[MAX_PATH];
-		GetSystemDirectoryA(path, MAX_PATH);
-		strcat_s(path, "\\d3d9.dll");
+		GetModuleFileNameA(hModule, path, MAX_PATH);
+		strcpy(strrchr(path, '\\'), "\\d3d9_original.dll");
 		d3d9dll = LoadLibraryA(path);
+		if (!d3d9dll)
+		{
+			WrapperLog("d3d9_original.dll not found, using system d3d9.dll\n");
+			GetSystemDirectoryA(path, MAX_PATH);
+			strcat_s(path, "\\d3d9.dll");
+			d3d9dll = LoadLibraryA(path);
+		}
+		else
+		{
+			WrapperLog("Loaded: %s\n", path);
+		}
 
 		if (d3d9dll)
 		{
@@ -1010,6 +1166,23 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 			bDoNotNotifyOnTaskSwitch = GetPrivateProfileInt("FORCEWINDOWED", "DoNotNotifyOnTaskSwitch", 0, path) != 0;
 			nForceWindowStyle = GetPrivateProfileInt("FORCEWINDOWED", "ForceWindowStyle", 0, path);
 			bCaptureMouse = GetPrivateProfileInt("FORCEWINDOWED", "CaptureMouse", 0, path) != 0;
+			nAntialiasing = GetPrivateProfileInt("GRAPHICS", "Antialiasing", 0, path);
+			nAnisotropicFiltering = GetPrivateProfileInt("GRAPHICS", "AnisotropicFiltering", 0, path);
+			bVSync = GetPrivateProfileInt("GRAPHICS", "VSync", 0, path) != 0;
+			bFXAA = GetPrivateProfileInt("GRAPHICS", "FXAA", 0, path) != 0;
+			{
+				char szBias[32];
+				GetPrivateProfileStringA("GRAPHICS", "TextureLODBias", "0", szBias, sizeof(szBias), path);
+				fTextureLODBias = static_cast<float>(atof(szBias));
+			}
+			nResolutionWidth = GetPrivateProfileInt("RESOLUTION", "Width", 0, path);
+			nResolutionHeight = GetPrivateProfileInt("RESOLUTION", "Height", 0, path);
+
+			WrapperLog("Ini: %s\n", path);
+			WrapperLog("  ForceWindowedMode=%d ForceWindowStyle=%d EnableHooks=%d DoNotNotify=%d\n",
+				bForceWindowedMode, nForceWindowStyle, bEnableHooks, bDoNotNotifyOnTaskSwitch);
+			WrapperLog("  Resolution=%dx%d  AF=%d  LODBias=%.2f  MSAA=%d  VSync=%d\n",
+				nResolutionWidth, nResolutionHeight, nAnisotropicFiltering, fTextureLODBias, nAntialiasing, bVSync);
 
 			if (fFPSLimit > 0.0f)
 			{

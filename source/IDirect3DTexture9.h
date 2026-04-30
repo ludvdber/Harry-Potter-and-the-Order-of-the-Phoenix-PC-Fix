@@ -5,6 +5,7 @@ class m_IDirect3DTexture9 : public IDirect3DTexture9, public AddressLookupTableO
 private:
 	LPDIRECT3DTEXTURE9 ProxyInterface;
 	m_IDirect3DDevice9Ex* m_pDeviceEx = nullptr;
+	bool m_needsMipRegen = false;
 
 public:
 	m_IDirect3DTexture9(LPDIRECT3DTEXTURE9 pTexture9, m_IDirect3DDevice9Ex* pDevice) : ProxyInterface(pTexture9), m_pDeviceEx(pDevice)
@@ -14,6 +15,7 @@ public:
 	~m_IDirect3DTexture9() {}
 
 	LPDIRECT3DTEXTURE9 GetProxyInterface() { return ProxyInterface; }
+	void SetNeedsMipRegen() { m_needsMipRegen = true; }
 
 	/*** IUnknown methods ***/
 	STDMETHOD(QueryInterface)(THIS_ REFIID riid, void** ppvObj);

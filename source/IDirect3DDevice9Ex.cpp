@@ -16,6 +16,13 @@
 
 #include "d3d9.h"
 
+extern int nAnisotropicFiltering;
+extern int nAntialiasing;
+extern int nBackBufferWidth;
+extern int nBackBufferHeight;
+extern float fTextureLODBias;
+extern void WrapperLog(const char* fmt, ...);
+
 HRESULT m_IDirect3DDevice9Ex::QueryInterface(REFIID riid, void** ppvObj)
 {
 	if ((riid == IID_IUnknown || riid == WrapperID) && ppvObj)
@@ -111,12 +118,10 @@ HRESULT m_IDirect3DDevice9Ex::CreateCubeTexture(THIS_ UINT EdgeLength, UINT Leve
 HRESULT m_IDirect3DDevice9Ex::CreateDepthStencilSurface(THIS_ UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Discard, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle)
 {
 	HRESULT hr = ProxyInterface->CreateDepthStencilSurface(Width, Height, Format, MultiSample, MultisampleQuality, Discard, ppSurface, pSharedHandle);
-
 	if (SUCCEEDED(hr) && ppSurface)
 	{
 		*ppSurface = new m_IDirect3DSurface9(*ppSurface, this);
 	}
-
 	return hr;
 }
 
@@ -135,22 +140,50 @@ HRESULT m_IDirect3DDevice9Ex::CreateIndexBuffer(THIS_ UINT Length, DWORD Usage, 
 HRESULT m_IDirect3DDevice9Ex::CreateRenderTarget(THIS_ UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Lockable, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle)
 {
 	HRESULT hr = ProxyInterface->CreateRenderTarget(Width, Height, Format, MultiSample, MultisampleQuality, Lockable, ppSurface, pSharedHandle);
-
 	if (SUCCEEDED(hr) && ppSurface)
 	{
 		*ppSurface = new m_IDirect3DSurface9(*ppSurface, this);
 	}
-
 	return hr;
 }
 
 HRESULT m_IDirect3DDevice9Ex::CreateTexture(THIS_ UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DTexture9** ppTexture, HANDLE* pSharedHandle)
 {
-	HRESULT hr = ProxyInterface->CreateTexture(Width, Height, Levels, Usage, Format, Pool, ppTexture, pSharedHandle);
+	// Most game textures are created with Levels=1 (no mipmaps), causing bilinear minification
+	// blur at distance. For all eligible textures: create with Levels=0 (full chain) so
+	// IDirect3DTexture9::UnlockRect can call D3DXFilterTexture (BOX filter) to generate
+	// high-quality mipmaps after the game uploads level 0. This is applied to all formats
+	// (including DXT) because GPU AUTOGENMIPMAP produces degraded results for compressed textures
+	// and inconsistent results across drivers even for uncompressed ones.
+	bool eligible = (Levels == 1)
+		&& !(Usage & D3DUSAGE_DYNAMIC)
+		&& !(Usage & D3DUSAGE_RENDERTARGET)
+		&& !(Usage & D3DUSAGE_DEPTHSTENCIL)
+		&& Pool != D3DPOOL_SYSTEMMEM;
+
+	HRESULT hr = E_FAIL;
+	bool needsMipRegen = false;
+
+	if (eligible)
+	{
+		// Full mip chain — D3DXFilterTexture fills all levels on UnlockRect(0)
+		hr = ProxyInterface->CreateTexture(Width, Height, 0, Usage, Format, Pool, ppTexture, pSharedHandle);
+		if (SUCCEEDED(hr))
+			needsMipRegen = true;
+		else
+			WrapperLog("CreateTexture %dx%d fmt=%d FAILED hr=0x%08X, falling back\n",
+				Width, Height, (int)Format, (unsigned)hr);
+	}
+
+	if (FAILED(hr))
+		hr = ProxyInterface->CreateTexture(Width, Height, Levels, Usage, Format, Pool, ppTexture, pSharedHandle);
 
 	if (SUCCEEDED(hr) && ppTexture)
 	{
-		*ppTexture = new m_IDirect3DTexture9(*ppTexture, this);
+		auto* wrapper = new m_IDirect3DTexture9(*ppTexture, this);
+		if (needsMipRegen)
+			wrapper->SetNeedsMipRegen();
+		*ppTexture = wrapper;
 	}
 
 	return hr;
@@ -582,7 +615,25 @@ HRESULT m_IDirect3DDevice9Ex::SetTexture(DWORD Stage, IDirect3DBaseTexture9 *pTe
 		}
 	}
 
-	return ProxyInterface->SetTexture(Stage, pTexture);
+	HRESULT hr = ProxyInterface->SetTexture(Stage, pTexture);
+	if (SUCCEEDED(hr) && pTexture)
+	{
+		// Always enable trilinear mip filtering — required for mipmaps to be used
+		ProxyInterface->SetSamplerState(Stage, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+
+		if (fTextureLODBias != 0.0f)
+		{
+			DWORD biasRaw;
+			memcpy(&biasRaw, &fTextureLODBias, sizeof(biasRaw));
+			ProxyInterface->SetSamplerState(Stage, D3DSAMP_MIPMAPLODBIAS, biasRaw);
+		}
+		if (nAnisotropicFiltering > 0)
+		{
+			ProxyInterface->SetSamplerState(Stage, D3DSAMP_MINFILTER, D3DTEXF_ANISOTROPIC);
+			ProxyInterface->SetSamplerState(Stage, D3DSAMP_MAXANISOTROPY, (DWORD)nAnisotropicFiltering);
+		}
+	}
+	return hr;
 }
 
 HRESULT m_IDirect3DDevice9Ex::SetTextureStageState(DWORD Stage, D3DTEXTURESTAGESTATETYPE Type, DWORD Value)
@@ -867,6 +918,48 @@ HRESULT m_IDirect3DDevice9Ex::GetSamplerState(THIS_ DWORD Sampler, D3DSAMPLERSTA
 
 HRESULT m_IDirect3DDevice9Ex::SetSamplerState(THIS_ DWORD Sampler, D3DSAMPLERSTATETYPE Type, DWORD Value)
 {
+	// Log the first sampler state calls that affect texture sharpness
+	static bool s_loggedBias = false, s_loggedMaxMip = false;
+	if (!s_loggedBias && Type == D3DSAMP_MIPMAPLODBIAS)
+	{
+		s_loggedBias = true;
+		float f; memcpy(&f, &Value, sizeof(f));
+		WrapperLog("Game SetSamplerState MIPMAPLODBIAS sampler=%u game_val=%.2f (we will override to %.2f)\n",
+			Sampler, f, fTextureLODBias);
+	}
+	if (!s_loggedMaxMip && Type == D3DSAMP_MAXMIPLEVEL)
+	{
+		s_loggedMaxMip = true;
+		WrapperLog("Game SetSamplerState MAXMIPLEVEL sampler=%u game_val=%u (we will force to 0)\n",
+			Sampler, Value);
+	}
+
+	if (nAnisotropicFiltering > 0)
+	{
+		// Force anisotropic min, linear mag, linear mip — full trilinear+aniso pipeline
+		if (Type == D3DSAMP_MINFILTER)
+			Value = D3DTEXF_ANISOTROPIC;
+		else if (Type == D3DSAMP_MAGFILTER && Value == D3DTEXF_POINT)
+			Value = D3DTEXF_LINEAR;
+		else if (Type == D3DSAMP_MIPFILTER && Value != D3DTEXF_LINEAR)
+			Value = D3DTEXF_LINEAR;
+		else if (Type == D3DSAMP_MAXANISOTROPY && Value < (DWORD)nAnisotropicFiltering)
+			Value = (DWORD)nAnisotropicFiltering;
+	}
+	else if (Type == D3DSAMP_MIPFILTER && Value == D3DTEXF_NONE)
+	{
+		Value = D3DTEXF_LINEAR;
+	}
+
+	if (fTextureLODBias != 0.0f && Type == D3DSAMP_MIPMAPLODBIAS)
+	{
+		DWORD biasRaw;
+		memcpy(&biasRaw, &fTextureLODBias, sizeof(biasRaw));
+		Value = biasRaw;
+	}
+	if (Type == D3DSAMP_MAXMIPLEVEL)
+		Value = 0;
+
 	return ProxyInterface->SetSamplerState(Sampler, Type, Value);
 }
 

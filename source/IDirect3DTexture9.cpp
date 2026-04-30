@@ -15,6 +15,9 @@
 */
 
 #include "d3d9.h"
+#include "d3dx9.h"
+
+extern void WrapperLog(const char* fmt, ...);
 
 HRESULT m_IDirect3DTexture9::QueryInterface(THIS_ REFIID riid, void** ppvObj)
 {
@@ -150,7 +153,20 @@ HRESULT m_IDirect3DTexture9::LockRect(THIS_ UINT Level, D3DLOCKED_RECT* pLockedR
 
 HRESULT m_IDirect3DTexture9::UnlockRect(THIS_ UINT Level)
 {
-	return ProxyInterface->UnlockRect(Level);
+	HRESULT hr = ProxyInterface->UnlockRect(Level);
+	if (SUCCEEDED(hr) && Level == 0 && m_needsMipRegen)
+	{
+		HRESULT hrFilter = D3DXFilterTexture(ProxyInterface, NULL, 0, D3DX_FILTER_TRIANGLE | D3DX_FILTER_DITHER | D3DX_FILTER_SRGB);
+		if (FAILED(hrFilter))
+		{
+			D3DSURFACE_DESC desc = {};
+			ProxyInterface->GetLevelDesc(0, &desc);
+			WrapperLog("D3DXFilterTexture FAILED %dx%d fmt=%d hr=0x%08X\n",
+				desc.Width, desc.Height, (int)desc.Format, (unsigned)hrFilter);
+		}
+		m_needsMipRegen = false;
+	}
+	return hr;
 }
 
 HRESULT m_IDirect3DTexture9::AddDirtyRect(THIS_ CONST RECT* pDirtyRect)
