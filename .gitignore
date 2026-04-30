@@ -18,3 +18,5 @@ data/x64/
 
 # Debug symbols
 *.pdb
+CLAUDE.md
+.claudeignore
