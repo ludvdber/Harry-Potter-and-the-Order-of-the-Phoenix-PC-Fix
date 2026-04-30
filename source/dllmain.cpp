@@ -63,6 +63,7 @@ bool bDoNotNotifyOnTaskSwitch;
 bool bDisplayFPSCounter;
 bool bEnableHooks;
 bool bCaptureMouse;
+bool bFreeMouse;
 float fFPSLimit;
 int nFullScreenRefreshRateInHz;
 int nForceWindowStyle;
@@ -75,6 +76,7 @@ int nResolutionHeight;
 int nBackBufferWidth = 0;
 int nBackBufferHeight = 0;
 bool bFXAA;
+int nSSAAFactor = 1;
 
 char WinDir[MAX_PATH + 1];
 
@@ -454,6 +456,26 @@ void ApplyGraphicsSettings(D3DPRESENT_PARAMETERS* pPresentationParameters)
 		pPresentationParameters->BackBufferHeight = nResolutionHeight;
 		WrapperLog("ApplyGraphicsSettings: overriding resolution to %dx%d\n", nResolutionWidth, nResolutionHeight);
 	}
+
+	// SSAA: gonfle le back buffer; le driver fait le bilinear downsample au Present (windowed mode).
+	// MSAA et SSAA combinés = explosion mémoire et redondant — on désactive MSAA si SSAA actif.
+	if (nSSAAFactor > 1)
+	{
+		pPresentationParameters->BackBufferWidth  *= nSSAAFactor;
+		pPresentationParameters->BackBufferHeight *= nSSAAFactor;
+		WrapperLog("ApplyGraphicsSettings: SSAA %dx -> internal back buffer %ux%u\n",
+			nSSAAFactor,
+			pPresentationParameters->BackBufferWidth,
+			pPresentationParameters->BackBufferHeight);
+		if (nAntialiasing > 0)
+		{
+			WrapperLog("ApplyGraphicsSettings: SSAA active, disabling MSAA %d\n", nAntialiasing);
+			nAntialiasing = 0;
+		}
+		// SwapEffect must be DISCARD for the driver to bilinear-stretch back buffer to window
+		pPresentationParameters->SwapEffect = D3DSWAPEFFECT_DISCARD;
+	}
+
 	nBackBufferWidth  = (int)pPresentationParameters->BackBufferWidth;
 	nBackBufferHeight = (int)pPresentationParameters->BackBufferHeight;
 
@@ -876,6 +898,26 @@ HWND __stdcall hk_GetFocus(void)
 	return hWndFocus;
 }
 
+// Free-mouse hooks: prevent the game from clipping the cursor to the window or
+// capturing exclusive mouse input. Lets the user move to other monitors / take
+// screenshots / press the Windows key without fighting the game.
+typedef BOOL(WINAPI* ClipCursor_fn)(const RECT*);
+typedef HWND(WINAPI* SetCapture_fn)(HWND);
+ClipCursor_fn oClipCursor = NULL;
+SetCapture_fn oSetCapture = NULL;
+
+BOOL WINAPI hk_ClipCursor(const RECT* lpRect)
+{
+	// Pretend success without actually clipping
+	return TRUE;
+}
+
+HWND WINAPI hk_SetCapture(HWND hWnd)
+{
+	// Pretend no previous capture without actually capturing
+	return NULL;
+}
+
 typedef HMODULE(__stdcall* LoadLibraryA_fn)(LPCSTR lpLibFileName);
 LoadLibraryA_fn oLoadLibraryA;
 
@@ -1166,6 +1208,7 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 			bDoNotNotifyOnTaskSwitch = GetPrivateProfileInt("FORCEWINDOWED", "DoNotNotifyOnTaskSwitch", 0, path) != 0;
 			nForceWindowStyle = GetPrivateProfileInt("FORCEWINDOWED", "ForceWindowStyle", 0, path);
 			bCaptureMouse = GetPrivateProfileInt("FORCEWINDOWED", "CaptureMouse", 0, path) != 0;
+			bFreeMouse = GetPrivateProfileInt("FORCEWINDOWED", "FreeMouse", 1, path) != 0;
 			nAntialiasing = GetPrivateProfileInt("GRAPHICS", "Antialiasing", 0, path);
 			nAnisotropicFiltering = GetPrivateProfileInt("GRAPHICS", "AnisotropicFiltering", 0, path);
 			bVSync = GetPrivateProfileInt("GRAPHICS", "VSync", 0, path) != 0;
@@ -1175,14 +1218,17 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 				GetPrivateProfileStringA("GRAPHICS", "TextureLODBias", "0", szBias, sizeof(szBias), path);
 				fTextureLODBias = static_cast<float>(atof(szBias));
 			}
+			nSSAAFactor = GetPrivateProfileInt("GRAPHICS", "SSAAFactor", 1, path);
+			if (nSSAAFactor < 1) nSSAAFactor = 1;
+			if (nSSAAFactor > 4) nSSAAFactor = 4;
 			nResolutionWidth = GetPrivateProfileInt("RESOLUTION", "Width", 0, path);
 			nResolutionHeight = GetPrivateProfileInt("RESOLUTION", "Height", 0, path);
 
 			WrapperLog("Ini: %s\n", path);
 			WrapperLog("  ForceWindowedMode=%d ForceWindowStyle=%d EnableHooks=%d DoNotNotify=%d\n",
 				bForceWindowedMode, nForceWindowStyle, bEnableHooks, bDoNotNotifyOnTaskSwitch);
-			WrapperLog("  Resolution=%dx%d  AF=%d  LODBias=%.2f  MSAA=%d  VSync=%d\n",
-				nResolutionWidth, nResolutionHeight, nAnisotropicFiltering, fTextureLODBias, nAntialiasing, bVSync);
+			WrapperLog("  Resolution=%dx%d  AF=%d  LODBias=%.2f  MSAA=%d  FXAA=%d  VSync=%d  SSAA=%dx\n",
+				nResolutionWidth, nResolutionHeight, nAnisotropicFiltering, fTextureLODBias, nAntialiasing, (int)bFXAA, (int)bVSync, nSSAAFactor);
 
 			if (fFPSLimit > 0.0f)
 			{
@@ -1195,6 +1241,19 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 			}
 			else
 				mFPSLimitMode = FrameLimiter::FPSLimitMode::FPS_NONE;
+
+			if (bFreeMouse && !bCaptureMouse)
+			{
+				HMODULE mainModule = GetModuleHandleA(nullptr);
+				auto originals = IATHook::Replace(
+					mainModule, "user32.dll",
+					std::make_tuple("ClipCursor", (void*)hk_ClipCursor),
+					std::make_tuple("SetCapture", (void*)hk_SetCapture)
+				);
+				if (oClipCursor == NULL) { auto it = originals.find("ClipCursor"); if (it != originals.end()) oClipCursor = (ClipCursor_fn)it->second.get(); }
+				if (oSetCapture == NULL) { auto it = originals.find("SetCapture"); if (it != originals.end()) oSetCapture = (SetCapture_fn)it->second.get(); }
+				WrapperLog("FreeMouse hooks installed (ClipCursor=%p, SetCapture=%p)\n", oClipCursor, oSetCapture);
+			}
 
 			if (bEnableHooks && (bDoNotNotifyOnTaskSwitch || bCaptureMouse))
 			{

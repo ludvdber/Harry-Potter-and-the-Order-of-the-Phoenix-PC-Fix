@@ -47,6 +47,31 @@ Choose one of the releases of either (60fps or 120fps) to use. If your monitor i
 # FOV
 You can choose in the d3d9.ini file of either 1, 2 or 3 each will zoom the FOV/camera in the game out slightly more. Choose which option you want to use and it will be reflected in the game, 0 is off or original game cameras zoom FOV.
 
+# Visual Quality Enhancements
+
+This fork extends the wrapper with several visual upgrades configured in `d3d9.ini`. All defaults are tuned to give a clear quality bump out of the box without manual tuning.
+
+## `[GRAPHICS]` section
+
+- **`FXAA`** (default `1`) — post-process anti-aliasing combined with adaptive sharpening. FXAA smooths jagged edges, the sharpening pass recovers texture detail. Near-zero performance cost.
+- **`AnisotropicFiltering`** (default `16`) — forces full trilinear + anisotropic filtering on every texture sampler regardless of the game's choice. Fixes streaky/blurry ground textures at oblique angles. Free on any modern GPU.
+- **`TextureLODBias`** (default `-1.0`) — biases mip selection toward sharper levels. Combined with the wrapper's automatic mipmap regeneration (the game ships textures without mip chains), this fixes blurry faces and surfaces at medium distance. Going below `-1.5` may cause shimmer at very long range.
+- **`SSAAFactor`** (default `1`) — set to `2`, `3` or `4` to render at NxN the back buffer resolution then downsample with bilinear filtering at present time. The strongest AA option (true supersampling), eliminates virtually all aliasing including thin sub-pixel features. Very expensive: `2x` quadruples GPU load. Disables MSAA when active. Recommended only with a high-end GPU.
+- **`Antialiasing`** (default `0`) — MSAA on the back buffer (2/4/8/16x). Off by default because MSAA can interact poorly with the game's intermediate render targets. Prefer FXAA or SSAA.
+- **`VSync`** (default `0`) — caps frame rate to your monitor's refresh rate.
+
+## `[RESOLUTION]` section
+
+- **`Width` / `Height`** (default `0`) — `0` means use the game's default resolution (typically your screen's native). Override only if you specifically want a different render resolution. With borderless fullscreen the result is stretched to your screen, so picking a value lower than your screen's native produces a blurry upscale.
+
+## `[FORCEWINDOWED]` section
+
+- **`FreeMouse`** (default `1`) — neutralizes the game's `ClipCursor` and `SetCapture` calls so the cursor can leave the window freely. Enables Alt+Tab, multi-monitor cursor movement, screenshot tools, and the Windows key. No impact on gameplay.
+
+## Mipmap regeneration
+
+The game ships character and surface textures without mip chains, which causes severe blur and shimmer at distance regardless of LOD bias. The wrapper detects single-mip textures at creation time and regenerates a full mip chain via `D3DXFilterTexture(TRIANGLE | DITHER | SRGB)` after the first upload. This is automatic and has no ini option — it always runs.
+
 # Vote to see the game return via GOG Dreamlist
 If you are interested in potentially seeing this game easily available to purchase and use today then go and vote on the games GOG Dreamlist to help make this become a reality, you can vote for the game here and write a message about the game if you wish – https://www.gog.com/dreamlist/game/harry-potter-and-the-order-of-the-phoenix-2007
 
