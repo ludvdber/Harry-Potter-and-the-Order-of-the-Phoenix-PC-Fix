@@ -99,7 +99,10 @@ Falls back silently if INTZ isn't supported.
 
 ### Alt+Tab behavior
 
-With the defaults above, Alt+Tab no longer freezes the game and the **mouse cursor recovers automatically** when you come back (the wrapper wraps DirectInput8 and forces a re-Acquire on focus return). **The keyboard does not recover** — you have to relaunch the game to get it back. This is a known limitation: HP5's main window doesn't receive the `WM_ACTIVATE` / `WM_ACTIVATEAPP` / `WM_SETFOCUS` messages after the first activation (only `WM_NCACTIVATE` arrives), so there's no reliable hook to re-acquire the keyboard on. If you Alt+Tab often, accept the relaunch cost.
+With the defaults above, Alt+Tab no longer freezes the game.
+
+- **Mouse recovers immediately** when you come back. The wrapper proxies DirectInput8 and forces a re-Acquire on `WM_ACTIVATEAPP(TRUE)`.
+- **Keyboard recovers on its own after ~30 seconds.** HP5's main window only receives `WM_NCACTIVATE` after the first activation (not `WM_ACTIVATE` / `WM_ACTIVATEAPP` / `WM_SETFOCUS`), so we can't trigger a keyboard re-Acquire from a Win32 hook — but the game's own DirectInput polling eventually times out and re-acquires the keyboard. The delay is constant. If you Alt+Tab once in a while, just wait; if you Alt+Tab often, relaunching is faster than waiting.
 
 ## `[RESOLUTION]` section
 
