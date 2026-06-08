@@ -21,6 +21,14 @@ extern int nAntialiasing;
 extern int nBackBufferWidth;
 extern int nBackBufferHeight;
 extern float fTextureLODBias;
+extern bool bSSAO;
+extern bool g_intzSupported;
+extern IDirect3DTexture9* g_sceneDepthTex;
+extern UINT  g_sceneDepthW;
+extern UINT  g_sceneDepthH;
+#ifndef D3DFMT_INTZ
+#define D3DFMT_INTZ ((D3DFORMAT)MAKEFOURCC('I','N','T','Z'))
+#endif
 extern void WrapperLog(const char* fmt, ...);
 
 HRESULT m_IDirect3DDevice9Ex::QueryInterface(REFIID riid, void** ppvObj)
@@ -117,6 +125,42 @@ HRESULT m_IDirect3DDevice9Ex::CreateCubeTexture(THIS_ UINT EdgeLength, UINT Leve
 
 HRESULT m_IDirect3DDevice9Ex::CreateDepthStencilSurface(THIS_ UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Discard, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle)
 {
+	// SSAO needs a sampleable depth. Replace the requested D24S8/D32 surface with a level-0 surface
+	// of an INTZ texture, which behaves identically as a depth-stencil target but is also sampleable.
+	if (bSSAO && g_intzSupported && ppSurface && MultiSample == D3DMULTISAMPLE_NONE && !pSharedHandle)
+	{
+		IDirect3DTexture9* intzTex = nullptr;
+		HRESULT hrTex = ProxyInterface->CreateTexture(Width, Height, 1, D3DUSAGE_DEPTHSTENCIL,
+			D3DFMT_INTZ, D3DPOOL_DEFAULT, &intzTex, nullptr);
+		if (SUCCEEDED(hrTex) && intzTex)
+		{
+			IDirect3DSurface9* intzSurf = nullptr;
+			HRESULT hrSurf = intzTex->GetSurfaceLevel(0, &intzSurf);
+			if (SUCCEEDED(hrSurf) && intzSurf)
+			{
+				WrapperLog("CreateDepthStencilSurface: %ux%u game_fmt=0x%X -> INTZ texture-backed surface\n",
+					Width, Height, (UINT)Format);
+				// If this depth surface matches the back buffer dimensions, it's the main scene depth.
+				// Cache the texture so SSAO can sample it even when the game unbinds depth before Present.
+				if ((int)Width == nBackBufferWidth && (int)Height == nBackBufferHeight)
+				{
+					if (g_sceneDepthTex) g_sceneDepthTex->Release();
+					intzTex->AddRef();
+					g_sceneDepthTex = intzTex;
+					g_sceneDepthW = Width;
+					g_sceneDepthH = Height;
+					WrapperLog("  -> cached as g_sceneDepthTex for SSAO\n");
+				}
+				intzTex->Release(); // surface internally holds a ref to the parent texture
+				*ppSurface = new m_IDirect3DSurface9(intzSurf, this);
+				return D3D_OK;
+			}
+			intzTex->Release();
+		}
+		WrapperLog("CreateDepthStencilSurface: INTZ replacement failed (hr=0x%X), using original 0x%X\n",
+			(UINT)hrTex, (UINT)Format);
+	}
+
 	HRESULT hr = ProxyInterface->CreateDepthStencilSurface(Width, Height, Format, MultiSample, MultisampleQuality, Discard, ppSurface, pSharedHandle);
 	if (SUCCEEDED(hr) && ppSurface)
 	{
@@ -1199,6 +1243,27 @@ HRESULT m_IDirect3DDevice9Ex::CreateOffscreenPlainSurfaceEx(THIS_ UINT Width, UI
 
 HRESULT m_IDirect3DDevice9Ex::CreateDepthStencilSurfaceEx(THIS_ UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Discard, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle, DWORD Usage)
 {
+	if (bSSAO && g_intzSupported && ppSurface && MultiSample == D3DMULTISAMPLE_NONE && !pSharedHandle)
+	{
+		IDirect3DTexture9* intzTex = nullptr;
+		HRESULT hrTex = ProxyInterface->CreateTexture(Width, Height, 1, D3DUSAGE_DEPTHSTENCIL,
+			D3DFMT_INTZ, D3DPOOL_DEFAULT, &intzTex, nullptr);
+		if (SUCCEEDED(hrTex) && intzTex)
+		{
+			IDirect3DSurface9* intzSurf = nullptr;
+			HRESULT hrSurf = intzTex->GetSurfaceLevel(0, &intzSurf);
+			intzTex->Release();
+			if (SUCCEEDED(hrSurf) && intzSurf)
+			{
+				WrapperLog("CreateDepthStencilSurfaceEx: %ux%u game_fmt=0x%X -> INTZ texture-backed surface\n",
+					Width, Height, (UINT)Format);
+				*ppSurface = new m_IDirect3DSurface9(intzSurf, this);
+				return D3D_OK;
+			}
+		}
+		WrapperLog("CreateDepthStencilSurfaceEx: INTZ replacement failed, using original 0x%X\n", (UINT)Format);
+	}
+
 	HRESULT hr = ProxyInterface->CreateDepthStencilSurfaceEx(Width, Height, Format, MultiSample, MultisampleQuality, Discard, ppSurface, pSharedHandle, Usage);
 
 	if (SUCCEEDED(hr) && ppSurface)

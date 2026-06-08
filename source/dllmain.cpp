@@ -18,6 +18,7 @@
 #include "d3dx9.h"
 #include "iathook.h"
 #include "helpers.h"
+#include "IDirectInput8.h"
 #include <cstdio>
 
 #pragma comment(lib, "d3dx9.lib")
@@ -77,6 +78,21 @@ int nBackBufferWidth = 0;
 int nBackBufferHeight = 0;
 bool bFXAA;
 int nSSAAFactor = 1;
+bool bColorGrading;
+float fVibrance;
+float fVignette;
+float fLift;
+float fGamma;
+float fGain;
+bool  bSSAO;
+float fSSAOStrength;
+float fSSAORadius;
+float fSSAOMinDelta;
+float fSSAOMaxDelta;
+bool  g_intzChecked = false;
+bool  g_intzSupported = false;
+IDirect3DTexture9* g_sceneDepthTex = nullptr;
+UINT  g_sceneDepthW = 0, g_sceneDepthH = 0;
 
 char WinDir[MAX_PATH + 1];
 
@@ -441,6 +457,33 @@ void ForceFullScreenRefreshRateInHz(D3DPRESENT_PARAMETERS* pPresentationParamete
 	}
 }
 
+// INTZ FOURCC: a depth-stencil format that's also sample-able as a regular texture.
+// Supported by every D3D10-class GPU (so any GPU made since ~2007).
+#ifndef D3DFMT_INTZ
+#define D3DFMT_INTZ ((D3DFORMAT)MAKEFOURCC('I','N','T','Z'))
+#endif
+
+bool CheckINTZSupport(IDirect3D9* pD3D9, UINT Adapter, D3DDEVTYPE DevType, D3DFORMAT /*ignored*/)
+{
+	if (g_intzChecked) return g_intzSupported;
+	g_intzChecked = true;
+	if (!pD3D9) { g_intzSupported = false; return false; }
+
+	// CheckDeviceFormat needs the *display* adapter format (typical X8R8G8B8), NOT the back-buffer
+	// format (which can be A8R8G8B8 — an invalid display format that makes the check fail).
+	D3DDISPLAYMODE mode = { 0 };
+	D3DFORMAT adapterFmt = D3DFMT_X8R8G8B8;
+	if (SUCCEEDED(pD3D9->GetAdapterDisplayMode(Adapter, &mode)))
+		adapterFmt = mode.Format;
+
+	HRESULT hr = pD3D9->CheckDeviceFormat(Adapter, DevType, adapterFmt,
+		D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, D3DFMT_INTZ);
+	g_intzSupported = SUCCEEDED(hr);
+	WrapperLog("INTZ depth-as-texture support: %s (adapterFmt=0x%X, hr=0x%X)\n",
+		g_intzSupported ? "YES" : "NO", (UINT)adapterFmt, (UINT)hr);
+	return g_intzSupported;
+}
+
 void ApplyGraphicsSettings(D3DPRESENT_PARAMETERS* pPresentationParameters)
 {
 	if (!pPresentationParameters)
@@ -449,6 +492,15 @@ void ApplyGraphicsSettings(D3DPRESENT_PARAMETERS* pPresentationParameters)
 	WrapperLog("ApplyGraphicsSettings: game requested %ux%u Windowed=%d\n",
 		pPresentationParameters->BackBufferWidth, pPresentationParameters->BackBufferHeight,
 		pPresentationParameters->Windowed);
+
+	// SSAO needs a sampleable depth buffer. Override AutoDepthStencilFormat to INTZ
+	// so D3D9 creates the auto depth as a texture we can read in our shader at present time.
+	if (bSSAO && g_intzSupported && pPresentationParameters->EnableAutoDepthStencil)
+	{
+		WrapperLog("ApplyGraphicsSettings: overriding AutoDepthStencilFormat 0x%X -> INTZ for SSAO\n",
+			(UINT)pPresentationParameters->AutoDepthStencilFormat);
+		pPresentationParameters->AutoDepthStencilFormat = D3DFMT_INTZ;
+	}
 
 	if (nResolutionWidth > 0 && nResolutionHeight > 0)
 	{
@@ -495,6 +547,9 @@ void ApplyGraphicsSettings(D3DPRESENT_PARAMETERS* pPresentationParameters)
 
 // Validate MSAA against the GPU. If unsupported, downgrade silently to D3DMULTISAMPLE_NONE
 // so CreateDevice/Reset doesn't fail. Returns true if a downgrade occurred.
+// Cascade MSAA level down (16 → 8 → 4 → 2 → NONE) until the driver supports it for both the
+// back buffer and the auto depth-stencil. Avoids the silent "disabled entirely" surprise when
+// a user asks for 16x and the driver caps at 8x.
 bool ValidateMSAASupport(IDirect3D9* pD3D9, UINT Adapter, D3DDEVTYPE DeviceType, D3DPRESENT_PARAMETERS* pPresentationParameters)
 {
 	if (!pD3D9 || !pPresentationParameters || pPresentationParameters->MultiSampleType == D3DMULTISAMPLE_NONE)
@@ -504,29 +559,49 @@ bool ValidateMSAASupport(IDirect3D9* pD3D9, UINT Adapter, D3DDEVTYPE DeviceType,
 	if (bbFormat == D3DFMT_UNKNOWN)
 		bbFormat = D3DFMT_X8R8G8B8;
 
-	HRESULT hr = pD3D9->CheckDeviceMultiSampleType(
-		Adapter, DeviceType, bbFormat,
-		pPresentationParameters->Windowed,
-		pPresentationParameters->MultiSampleType, NULL);
-
-	if (SUCCEEDED(hr) && pPresentationParameters->EnableAutoDepthStencil)
+	const D3DMULTISAMPLE_TYPE requested = pPresentationParameters->MultiSampleType;
+	D3DMULTISAMPLE_TYPE level = requested;
+	while (level != D3DMULTISAMPLE_NONE)
 	{
-		hr = pD3D9->CheckDeviceMultiSampleType(
-			Adapter, DeviceType, pPresentationParameters->AutoDepthStencilFormat,
+		HRESULT hr = pD3D9->CheckDeviceMultiSampleType(
+			Adapter, DeviceType, bbFormat,
 			pPresentationParameters->Windowed,
-			pPresentationParameters->MultiSampleType, NULL);
+			level, NULL);
+
+		if (SUCCEEDED(hr) && pPresentationParameters->EnableAutoDepthStencil)
+		{
+			hr = pD3D9->CheckDeviceMultiSampleType(
+				Adapter, DeviceType, pPresentationParameters->AutoDepthStencilFormat,
+				pPresentationParameters->Windowed,
+				level, NULL);
+		}
+
+		if (SUCCEEDED(hr))
+		{
+			pPresentationParameters->MultiSampleType = level;
+			pPresentationParameters->MultiSampleQuality = 0;
+			if (level == requested)
+				WrapperLog("ValidateMSAASupport: MSAA %d OK\n", (int)level);
+			else
+				WrapperLog("ValidateMSAASupport: MSAA %d unsupported, downgraded to %d\n", (int)requested, (int)level);
+			return false;
+		}
+
+		// Drop to next supported level: 16 -> 8 -> 4 -> 2 -> NONE
+		switch (level)
+		{
+		case D3DMULTISAMPLE_16_SAMPLES: level = D3DMULTISAMPLE_8_SAMPLES; break;
+		case D3DMULTISAMPLE_8_SAMPLES:  level = D3DMULTISAMPLE_4_SAMPLES; break;
+		case D3DMULTISAMPLE_4_SAMPLES:  level = D3DMULTISAMPLE_2_SAMPLES; break;
+		case D3DMULTISAMPLE_2_SAMPLES:  level = D3DMULTISAMPLE_NONE;      break;
+		default:                        level = D3DMULTISAMPLE_NONE;      break;
+		}
 	}
 
-	if (FAILED(hr))
-	{
-		WrapperLog("ValidateMSAASupport: MSAA %d not supported, disabling\n", (int)pPresentationParameters->MultiSampleType);
-		pPresentationParameters->MultiSampleType = D3DMULTISAMPLE_NONE;
-		pPresentationParameters->MultiSampleQuality = 0;
-		return true;
-	}
-
-	WrapperLog("ValidateMSAASupport: MSAA %d OK\n", (int)pPresentationParameters->MultiSampleType);
-	return false;
+	WrapperLog("ValidateMSAASupport: MSAA %d unsupported, no level worked, disabling\n", (int)requested);
+	pPresentationParameters->MultiSampleType = D3DMULTISAMPLE_NONE;
+	pPresentationParameters->MultiSampleQuality = 0;
+	return true;
 }
 
 HRESULT m_IDirect3D9Ex::CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType, HWND hFocusWindow, DWORD BehaviorFlags, D3DPRESENT_PARAMETERS* pPresentationParameters, IDirect3DDevice9** ppReturnedDeviceInterface)
@@ -540,6 +615,10 @@ HRESULT m_IDirect3D9Ex::CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType, HWND h
 	if (nFullScreenRefreshRateInHz)
 		ForceFullScreenRefreshRateInHz(pPresentationParameters);
 
+	D3DFORMAT bbFmt = (pPresentationParameters && pPresentationParameters->BackBufferFormat != D3DFMT_UNKNOWN)
+		? pPresentationParameters->BackBufferFormat : D3DFMT_X8R8G8B8;
+	CheckINTZSupport(ProxyInterface, Adapter, DeviceType, bbFmt);
+	D3DFORMAT origAutoDepth = pPresentationParameters ? pPresentationParameters->AutoDepthStencilFormat : D3DFMT_UNKNOWN;
 	ApplyGraphicsSettings(pPresentationParameters);
 	ValidateMSAASupport(ProxyInterface, Adapter, DeviceType, pPresentationParameters);
 
@@ -555,6 +634,13 @@ HRESULT m_IDirect3D9Ex::CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType, HWND h
 
 	HRESULT hr = ProxyInterface->CreateDevice(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, ppReturnedDeviceInterface);
 
+	if (FAILED(hr) && pPresentationParameters && pPresentationParameters->AutoDepthStencilFormat == D3DFMT_INTZ)
+	{
+		WrapperLog("CreateDevice failed with INTZ depth, retrying with original 0x%X\n", (UINT)origAutoDepth);
+		pPresentationParameters->AutoDepthStencilFormat = origAutoDepth;
+		hr = ProxyInterface->CreateDevice(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, ppReturnedDeviceInterface);
+	}
+
 	if (FAILED(hr) && pPresentationParameters && pPresentationParameters->MultiSampleType != D3DMULTISAMPLE_NONE)
 	{
 		pPresentationParameters->MultiSampleType = D3DMULTISAMPLE_NONE;
@@ -562,8 +648,15 @@ HRESULT m_IDirect3D9Ex::CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType, HWND h
 		hr = ProxyInterface->CreateDevice(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, ppReturnedDeviceInterface);
 	}
 
-	if (SUCCEEDED(hr) && ppReturnedDeviceInterface)
+	if (SUCCEEDED(hr) && ppReturnedDeviceInterface && *ppReturnedDeviceInterface)
 	{
+		IDirect3DDevice9Ex* pEx = nullptr;
+		if (SUCCEEDED((*ppReturnedDeviceInterface)->QueryInterface(IID_IDirect3DDevice9Ex, (void**)&pEx)))
+		{
+			pEx->SetMaximumFrameLatency(1);
+			pEx->Release();
+			WrapperLog("CreateDevice: SetMaximumFrameLatency(1) applied\n");
+		}
 		*ppReturnedDeviceInterface = new m_IDirect3DDevice9Ex((IDirect3DDevice9Ex*)*ppReturnedDeviceInterface, this, IID_IDirect3DDevice9);
 	}
 
@@ -582,6 +675,7 @@ HRESULT m_IDirect3DDevice9Ex::Reset(D3DPRESENT_PARAMETERS* pPresentationParamete
 	if (nFullScreenRefreshRateInHz)
 		ForceFullScreenRefreshRateInHz(pPresentationParameters);
 
+	D3DFORMAT origAutoDepth = pPresentationParameters ? pPresentationParameters->AutoDepthStencilFormat : D3DFMT_UNKNOWN;
 	ApplyGraphicsSettings(pPresentationParameters);
 
 	if (bDisplayFPSCounter)
@@ -593,6 +687,13 @@ HRESULT m_IDirect3DDevice9Ex::Reset(D3DPRESENT_PARAMETERS* pPresentationParamete
 	}
 
 	auto hRet = ProxyInterface->Reset(pPresentationParameters);
+
+	if (FAILED(hRet) && pPresentationParameters && pPresentationParameters->AutoDepthStencilFormat == D3DFMT_INTZ)
+	{
+		WrapperLog("Reset failed with INTZ depth, retrying with original 0x%X\n", (UINT)origAutoDepth);
+		pPresentationParameters->AutoDepthStencilFormat = origAutoDepth;
+		hRet = ProxyInterface->Reset(pPresentationParameters);
+	}
 
 	if (FAILED(hRet) && pPresentationParameters && pPresentationParameters->MultiSampleType != D3DMULTISAMPLE_NONE)
 	{
@@ -626,6 +727,10 @@ HRESULT m_IDirect3D9Ex::CreateDeviceEx(THIS_ UINT Adapter, D3DDEVTYPE DeviceType
 	if (nFullScreenRefreshRateInHz)
 		ForceFullScreenRefreshRateInHz(pPresentationParameters);
 
+	D3DFORMAT bbFmt = (pPresentationParameters && pPresentationParameters->BackBufferFormat != D3DFMT_UNKNOWN)
+		? pPresentationParameters->BackBufferFormat : D3DFMT_X8R8G8B8;
+	CheckINTZSupport(ProxyInterface, Adapter, DeviceType, bbFmt);
+	D3DFORMAT origAutoDepth = pPresentationParameters ? pPresentationParameters->AutoDepthStencilFormat : D3DFMT_UNKNOWN;
 	ApplyGraphicsSettings(pPresentationParameters);
 	ValidateMSAASupport(ProxyInterface, Adapter, DeviceType, pPresentationParameters);
 
@@ -641,6 +746,13 @@ HRESULT m_IDirect3D9Ex::CreateDeviceEx(THIS_ UINT Adapter, D3DDEVTYPE DeviceType
 
 	HRESULT hr = ProxyInterface->CreateDeviceEx(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, pFullscreenDisplayMode, ppReturnedDeviceInterface);
 
+	if (FAILED(hr) && pPresentationParameters && pPresentationParameters->AutoDepthStencilFormat == D3DFMT_INTZ)
+	{
+		WrapperLog("CreateDeviceEx failed with INTZ depth, retrying with original 0x%X\n", (UINT)origAutoDepth);
+		pPresentationParameters->AutoDepthStencilFormat = origAutoDepth;
+		hr = ProxyInterface->CreateDeviceEx(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, pFullscreenDisplayMode, ppReturnedDeviceInterface);
+	}
+
 	if (FAILED(hr) && pPresentationParameters && pPresentationParameters->MultiSampleType != D3DMULTISAMPLE_NONE)
 	{
 		pPresentationParameters->MultiSampleType = D3DMULTISAMPLE_NONE;
@@ -648,8 +760,10 @@ HRESULT m_IDirect3D9Ex::CreateDeviceEx(THIS_ UINT Adapter, D3DDEVTYPE DeviceType
 		hr = ProxyInterface->CreateDeviceEx(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, pFullscreenDisplayMode, ppReturnedDeviceInterface);
 	}
 
-	if (SUCCEEDED(hr) && ppReturnedDeviceInterface)
+	if (SUCCEEDED(hr) && ppReturnedDeviceInterface && *ppReturnedDeviceInterface)
 	{
+		(*ppReturnedDeviceInterface)->SetMaximumFrameLatency(1);
+		WrapperLog("CreateDeviceEx: SetMaximumFrameLatency(1) applied\n");
 		*ppReturnedDeviceInterface = new m_IDirect3DDevice9Ex(*ppReturnedDeviceInterface, this, IID_IDirect3DDevice9Ex);
 	}
 
@@ -658,12 +772,15 @@ HRESULT m_IDirect3D9Ex::CreateDeviceEx(THIS_ UINT Adapter, D3DDEVTYPE DeviceType
 
 HRESULT m_IDirect3DDevice9Ex::ResetEx(THIS_ D3DPRESENT_PARAMETERS* pPresentationParameters, D3DDISPLAYMODEEX* pFullscreenDisplayMode)
 {
+	FreeFXAA();
+
 	if (bForceWindowedMode)
 		ForceWindowed(pPresentationParameters, pFullscreenDisplayMode);
 
 	if (nFullScreenRefreshRateInHz)
 		ForceFullScreenRefreshRateInHz(pPresentationParameters);
 
+	D3DFORMAT origAutoDepth = pPresentationParameters ? pPresentationParameters->AutoDepthStencilFormat : D3DFMT_UNKNOWN;
 	ApplyGraphicsSettings(pPresentationParameters);
 
 	if (bDisplayFPSCounter)
@@ -675,6 +792,13 @@ HRESULT m_IDirect3DDevice9Ex::ResetEx(THIS_ D3DPRESENT_PARAMETERS* pPresentation
 	}
 
 	auto hRet = ProxyInterface->ResetEx(pPresentationParameters, pFullscreenDisplayMode);
+
+	if (FAILED(hRet) && pPresentationParameters && pPresentationParameters->AutoDepthStencilFormat == D3DFMT_INTZ)
+	{
+		WrapperLog("ResetEx failed with INTZ depth, retrying with original 0x%X\n", (UINT)origAutoDepth);
+		pPresentationParameters->AutoDepthStencilFormat = origAutoDepth;
+		hRet = ProxyInterface->ResetEx(pPresentationParameters, pFullscreenDisplayMode);
+	}
 
 	if (FAILED(hRet) && pPresentationParameters && pPresentationParameters->MultiSampleType != D3DMULTISAMPLE_NONE)
 	{
@@ -709,40 +833,25 @@ LRESULT WINAPI CustomWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
 		switch (uMsg)
 		{
 		case WM_ACTIVATE:
-			if (bDoNotNotifyOnTaskSwitch && LOWORD(wParam) == WA_INACTIVE)
-			{
-				if ((HWND)lParam == NULL)
-					return 0;
-				DWORD dwPID = 0;
-				GetWindowThreadProcessId((HWND)lParam, &dwPID);
-				if (dwPID != GetCurrentProcessId())
-					return 0;
-			}
 			if (bCaptureMouse && LOWORD(wParam) != WA_INACTIVE)
 				CaptureMouse(hWnd);
 			break;
 		case WM_NCACTIVATE:
-			if (bDoNotNotifyOnTaskSwitch && LOWORD(wParam) == WA_INACTIVE)
-				return 0;
 			if (bCaptureMouse && LOWORD(wParam) != WA_INACTIVE)
 				CaptureMouse(hWnd);
 			break;
 		case WM_ACTIVATEAPP:
+			// On focus return, force DI8 mouse re-Acquire — the game's polling otherwise
+			// stays in a "ghost acquired" state and the cursor stops responding.
+			if (wParam == TRUE)
+				DirectInputReAcquireMice();
+			// Swallow the deactivation message to prevent HP5's freeze on focus loss.
 			if (bDoNotNotifyOnTaskSwitch && wParam == FALSE)
 				return 0;
 			if (bCaptureMouse && wParam == TRUE)
 				CaptureMouse(hWnd);
 			break;
 		case WM_KILLFOCUS:
-			if (bDoNotNotifyOnTaskSwitch)
-			{
-				if ((HWND)wParam == NULL)
-					return 0;
-				DWORD dwPID = 0;
-				GetWindowThreadProcessId((HWND)wParam, &dwPID);
-				if (dwPID != GetCurrentProcessId())
-					return 0;
-			}
 			break;
 		case WM_SETFOCUS:
 		case WM_MOUSEACTIVATE:
@@ -1221,6 +1330,23 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 			nSSAAFactor = GetPrivateProfileInt("GRAPHICS", "SSAAFactor", 1, path);
 			if (nSSAAFactor < 1) nSSAAFactor = 1;
 			if (nSSAAFactor > 4) nSSAAFactor = 4;
+			bColorGrading = GetPrivateProfileInt("GRAPHICS", "ColorGrading", 1, path) != 0;
+			{
+				char szF[32];
+				GetPrivateProfileStringA("GRAPHICS", "Vibrance",  "0.15", szF, sizeof(szF), path); fVibrance = (float)atof(szF);
+				GetPrivateProfileStringA("GRAPHICS", "Vignette",  "0.40", szF, sizeof(szF), path); fVignette = (float)atof(szF);
+				GetPrivateProfileStringA("GRAPHICS", "Lift",      "0.00", szF, sizeof(szF), path); fLift     = (float)atof(szF);
+				GetPrivateProfileStringA("GRAPHICS", "Gamma",     "1.00", szF, sizeof(szF), path); fGamma    = (float)atof(szF);
+				GetPrivateProfileStringA("GRAPHICS", "Gain",      "1.05", szF, sizeof(szF), path); fGain     = (float)atof(szF);
+			}
+			bSSAO = GetPrivateProfileInt("GRAPHICS", "SSAO", 0, path) != 0;
+			{
+				char szF[32];
+				GetPrivateProfileStringA("GRAPHICS", "SSAOStrength", "0.50", szF, sizeof(szF), path); fSSAOStrength = (float)atof(szF);
+				GetPrivateProfileStringA("GRAPHICS", "SSAORadius",   "6.0",  szF, sizeof(szF), path); fSSAORadius   = (float)atof(szF);
+				GetPrivateProfileStringA("GRAPHICS", "SSAOMinDelta", "0.0005", szF, sizeof(szF), path); fSSAOMinDelta = (float)atof(szF);
+				GetPrivateProfileStringA("GRAPHICS", "SSAOMaxDelta", "0.05",   szF, sizeof(szF), path); fSSAOMaxDelta = (float)atof(szF);
+			}
 			nResolutionWidth = GetPrivateProfileInt("RESOLUTION", "Width", 0, path);
 			nResolutionHeight = GetPrivateProfileInt("RESOLUTION", "Height", 0, path);
 
@@ -1229,6 +1355,10 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 				bForceWindowedMode, nForceWindowStyle, bEnableHooks, bDoNotNotifyOnTaskSwitch);
 			WrapperLog("  Resolution=%dx%d  AF=%d  LODBias=%.2f  MSAA=%d  FXAA=%d  VSync=%d  SSAA=%dx\n",
 				nResolutionWidth, nResolutionHeight, nAnisotropicFiltering, fTextureLODBias, nAntialiasing, (int)bFXAA, (int)bVSync, nSSAAFactor);
+			WrapperLog("  ColorGrading=%d  Vibrance=%.2f  Vignette=%.2f  Lift=%.2f  Gamma=%.2f  Gain=%.2f\n",
+				(int)bColorGrading, fVibrance, fVignette, fLift, fGamma, fGain);
+			WrapperLog("  SSAO=%d  Strength=%.2f  Radius=%.1f  MinDelta=%.4f  MaxDelta=%.4f\n",
+				(int)bSSAO, fSSAOStrength, fSSAORadius, fSSAOMinDelta, fSSAOMaxDelta);
 
 			if (fFPSLimit > 0.0f)
 			{
@@ -1254,6 +1384,8 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 				if (oSetCapture == NULL) { auto it = originals.find("SetCapture"); if (it != originals.end()) oSetCapture = (SetCapture_fn)it->second.get(); }
 				WrapperLog("FreeMouse hooks installed (ClipCursor=%p, SetCapture=%p)\n", oClipCursor, oSetCapture);
 			}
+
+			InstallDirectInputHook();
 
 			if (bEnableHooks && (bDoNotNotifyOnTaskSwitch || bCaptureMouse))
 			{

@@ -242,6 +242,7 @@
     <ClInclude Include="..\source\d3d9.h" />
     <ClInclude Include="..\source\helpers.h" />
     <ClInclude Include="..\source\iathook.h" />
+    <ClInclude Include="..\source\IDirectInput8.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\source\IDirect3D9Ex.cpp" />
@@ -260,6 +261,7 @@
     <ClCompile Include="..\source\IDirect3DVolume9.cpp" />
     <ClCompile Include="..\source\IDirect3DVolumeTexture9.cpp" />
     <ClCompile Include="..\source\InterfaceQuery.cpp" />
+    <ClCompile Include="..\source\IDirectInput8.cpp" />
     <ClCompile Include="..\source\dllmain.cpp" />
   </ItemGroup>
   <ItemGroup>

@@ -49,28 +49,73 @@ You can choose in the d3d9.ini file of either 1, 2 or 3 each will zoom the FOV/c
 
 # Visual Quality Enhancements
 
-This fork extends the wrapper with several visual upgrades configured in `d3d9.ini`. All defaults are tuned to give a clear quality bump out of the box without manual tuning.
+This fork extends the wrapper with several visual upgrades configured in `d3d9.ini`. All defaults are tuned to give a clear quality bump out of the box without manual tuning. Drop the new `d3d9.dll` and `d3d9.ini` next to `hp.exe` and you're set.
 
-## `[GRAPHICS]` section
+## `[GRAPHICS]` — anti-aliasing and texture filtering
 
-- **`FXAA`** (default `1`) — post-process anti-aliasing combined with adaptive sharpening. FXAA smooths jagged edges, the sharpening pass recovers texture detail. Near-zero performance cost.
+- **`FXAA`** (default `1`) — post-process anti-aliasing combined with adaptive sharpening. FXAA smooths jagged edges; the sharpening pass recovers texture detail. Near-zero performance cost. Also hosts the color grading and SSAO passes below — turning FXAA off disables both.
+- **`Antialiasing`** (default `8`) — MSAA on the back buffer (2/4/8/16x). The wrapper queries the driver and **cascades down** (16 → 8 → 4 → 2 → off) until it finds a level the GPU supports — no more "asked for 16x, silently disabled" surprises. Set to `0` if you observe artifacts on character rendering.
 - **`AnisotropicFiltering`** (default `16`) — forces full trilinear + anisotropic filtering on every texture sampler regardless of the game's choice. Fixes streaky/blurry ground textures at oblique angles. Free on any modern GPU.
 - **`TextureLODBias`** (default `-1.0`) — biases mip selection toward sharper levels. Combined with the wrapper's automatic mipmap regeneration (the game ships textures without mip chains), this fixes blurry faces and surfaces at medium distance. Going below `-1.5` may cause shimmer at very long range.
 - **`SSAAFactor`** (default `1`) — set to `2`, `3` or `4` to render at NxN the back buffer resolution then downsample with bilinear filtering at present time. The strongest AA option (true supersampling), eliminates virtually all aliasing including thin sub-pixel features. Very expensive: `2x` quadruples GPU load. Disables MSAA when active. Recommended only with a high-end GPU.
-- **`Antialiasing`** (default `0`) — MSAA on the back buffer (2/4/8/16x). Off by default because MSAA can interact poorly with the game's intermediate render targets. Prefer FXAA or SSAA.
 - **`VSync`** (default `0`) — caps frame rate to your monitor's refresh rate.
+
+### Color grading (folded into the FXAA pass)
+
+The 2007 base render is technically clean but visually flat — washed greens, no cinematic depth. The wrapper applies a subtle ASC-CDL-style grade in the same shader pass as FXAA, so it costs zero extra draw call.
+
+- **`ColorGrading`** (default `1`) — `0` = bypass (neutral pass-through), `1` = apply the values below.
+- **`Vibrance`** (default `0.25`) — boosts saturation of *low*-saturation pixels (skin, robes, stone) without over-saturating already-colorful pixels. Range `0.0..1.0`.
+- **`Vignette`** (default `0.00`) — radial darkening at screen corners for cinematic focus. Range `0.0..1.0`.
+- **`Lift`** (default `0.00`) — raises shadows. Positive = lifted blacks (faded film look). Range `-0.10..+0.10`.
+- **`Gamma`** (default `1.00`) — midtone curve. `<1` brightens mids, `>1` darkens them. Range `0.5..2.0`.
+- **`Gain`** (default `1.05`) — overall multiplier before gamma. `>1` = brighter and punchier. Range `0.5..2.0`.
+
+### Frame latency
+
+On any GPU that exposes `IDirect3DDevice9Ex` (every Vista+ driver), the wrapper calls `SetMaximumFrameLatency(1)` right after device creation. This shaves one frame of input lag versus the Windows default of 3 — perceptible on any game above 60 FPS. No ini option, always on.
+
+### Screen-space ambient occlusion (SSAO)
+
+Off by default. When `SSAO = 1`, the wrapper:
+
+1. At device creation, checks the GPU for the `INTZ` depth-as-texture format (every D3D10+ GPU supports it).
+2. Overrides `AutoDepthStencilFormat` to `INTZ` so the auto depth-stencil becomes a sampleable texture instead of an opaque surface, and intercepts `CreateDepthStencilSurface` to do the same for game-created depth (HP5 uses this path).
+3. In the FXAA pass, performs an 8-tap radial depth comparison around each pixel; pixels with neighbors closer to the camera (= occluders) within a tunable delta range get darkened.
+4. Composites with the FXAA + grading output in the same shader pass — no extra draw call.
+
+Falls back silently if INTZ isn't supported.
+
+- **`SSAO`** (default `0`) — `0` off, `1` on. Adds ~8 depth taps per pixel; cost is negligible on any GPU made in the last decade.
+- **`SSAOStrength`** (default `0.80`) — `0..1`. How much occlusion darkens occluded pixels.
+- **`SSAORadius`** (default `6.0`) — `1..16` pixels. Sampling radius — larger = softer/wider halo, smaller = tight contact AO.
+- **`SSAOMinDelta`** (default `0.001`) — perspective-relative depth threshold. Below this, samples are ignored (avoids self-occlusion noise on flat surfaces).
+- **`SSAOMaxDelta`** (default `0.30`) — perspective-relative depth threshold. Above this, samples are ignored (avoids halos around foreground objects). Tighten if you see halos around characters.
+
+## `[FORCEWINDOWED]` — windowed mode and Alt+Tab
+
+- **`FreeMouse`** (default `1`) — neutralizes the game's `ClipCursor` and `SetCapture` calls so the cursor can leave the window freely. Enables Alt+Tab, multi-monitor cursor movement, screenshot tools, and the Windows key. No impact on gameplay.
+- **`DoNotNotifyOnTaskSwitch`** (default `1`) — swallows the `WM_ACTIVATEAPP(FALSE)` message HP5 reacts to on focus loss. Without this, Alt+Tabbing away can freeze the game on return. Works without `EnableHooks` because the wrapper subclasses HP5's window directly via `SetWindowLongPtr`.
+
+### Alt+Tab behavior
+
+With the defaults above, Alt+Tab no longer freezes the game and the **mouse cursor recovers automatically** when you come back (the wrapper wraps DirectInput8 and forces a re-Acquire on focus return). **The keyboard does not recover** — you have to relaunch the game to get it back. This is a known limitation: HP5's main window doesn't receive the `WM_ACTIVATE` / `WM_ACTIVATEAPP` / `WM_SETFOCUS` messages after the first activation (only `WM_NCACTIVATE` arrives), so there's no reliable hook to re-acquire the keyboard on. If you Alt+Tab often, accept the relaunch cost.
 
 ## `[RESOLUTION]` section
 
 - **`Width` / `Height`** (default `0`) — `0` means use the game's default resolution (typically your screen's native). Override only if you specifically want a different render resolution. With borderless fullscreen the result is stretched to your screen, so picking a value lower than your screen's native produces a blurry upscale.
 
-## `[FORCEWINDOWED]` section
-
-- **`FreeMouse`** (default `1`) — neutralizes the game's `ClipCursor` and `SetCapture` calls so the cursor can leave the window freely. Enables Alt+Tab, multi-monitor cursor movement, screenshot tools, and the Windows key. No impact on gameplay.
-
 ## Mipmap regeneration
 
 The game ships character and surface textures without mip chains, which causes severe blur and shimmer at distance regardless of LOD bias. The wrapper detects single-mip textures at creation time and regenerates a full mip chain via `D3DXFilterTexture(TRIANGLE | DITHER | SRGB)` after the first upload. This is automatic and has no ini option — it always runs.
+
+## Logging
+
+Every game launch writes a fresh `d3d9_wrapper.log` next to `hp.exe` describing which features actually engaged on your hardware (INTZ support, MSAA cascade result, AF/LOD bias overrides, etc.). Tail this file first if anything looks off.
+
+## Footgun — leave `EnableHooks=0`
+
+The original wrapper exposes `EnableHooks=1` to install a process-wide IAT hook chain. On HP5 specifically, this crashes `hp.exe` at `DLL_PROCESS_ATTACH` — the chain rewrites `RegisterClassA/W/Ex`, `LoadLibraryA/W/Ex`, `FreeLibrary`, `GetProcAddress` across `hp.exe` + `ole32.dll` + `d3d9.dll`, and the game never launches. Symptom: the log stops on `FreeMouse hooks installed` and you see no window. Leave `EnableHooks=0` (the default).
 
 # Vote to see the game return via GOG Dreamlist
 If you are interested in potentially seeing this game easily available to purchase and use today then go and vote on the games GOG Dreamlist to help make this become a reality, you can vote for the game here and write a message about the game if you wish – https://www.gog.com/dreamlist/game/harry-potter-and-the-order-of-the-phoenix-2007

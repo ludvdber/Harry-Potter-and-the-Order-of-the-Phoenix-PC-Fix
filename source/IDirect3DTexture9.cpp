@@ -156,6 +156,9 @@ HRESULT m_IDirect3DTexture9::UnlockRect(THIS_ UINT Level)
 	HRESULT hr = ProxyInterface->UnlockRect(Level);
 	if (SUCCEEDED(hr) && Level == 0 && m_needsMipRegen)
 	{
+		// Game shipped this texture with Levels=1 (no mips) — fill the chain we forced via
+		// CreateTexture(Levels=0). TRIANGLE filter + DITHER + SRGB-aware averaging gives
+		// noticeably crisper distance rendering than bilinear/box filters.
 		HRESULT hrFilter = D3DXFilterTexture(ProxyInterface, NULL, 0, D3DX_FILTER_TRIANGLE | D3DX_FILTER_DITHER | D3DX_FILTER_SRGB);
 		if (FAILED(hrFilter))
 		{
