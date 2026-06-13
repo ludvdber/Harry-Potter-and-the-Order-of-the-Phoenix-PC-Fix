@@ -32,6 +32,19 @@ extern UINT g_sceneDepthRTW;
 extern UINT g_sceneDepthRTH;
 extern bool g_aoDoneThisFrame;
 extern void DeviceSSAOAtUnbind(IDirect3DDevice9* dev);
+extern int nShadowMapScale;
+extern bool g_curRTUpscaled;
+extern UINT g_curRTOrigW;
+extern UINT g_curRTOrigH;
+extern void TrackUpscaledRT(IDirect3DTexture9* realTex, IDirect3DSurface9* realSurf, UINT origW, UINT origH);
+extern bool LookupUpscaledRT(IDirect3DSurface9* realSurf, UINT* origW, UINT* origH);
+
+// Shadow-map candidates observed in the Census: small square DEFAULT-pool render targets and
+// their matching depth surfaces (128/256/512). Anything bigger or non-square is scene-sized.
+static inline bool IsShadowMapSized(UINT Width, UINT Height)
+{
+	return Width == Height && Width >= 32 && Width <= 512;
+}
 extern int g_dsBindCount;
 extern int g_dsNullUnbindCount;
 extern int g_dsSceneUnbindOnBB;
@@ -140,12 +153,23 @@ HRESULT m_IDirect3DDevice9Ex::CreateDepthStencilSurface(THIS_ UINT Width, UINT H
 {
 	LogSurfaceCensus("DS", Width, Height, (UINT)Format, 0, D3DPOOL_DEFAULT, (UINT)MultiSample);
 
+	// Shadow-map upscaling: a shadow render target's depth partner must grow by the same factor
+	// (D3D9 requires depth >= render target). Done before the INTZ decision below.
+	bool shadowUpscaled = false;
+	if (nShadowMapScale > 1 && MultiSample == D3DMULTISAMPLE_NONE && IsShadowMapSized(Width, Height))
+	{
+		WrapperLog("ShadowScale: DS %ux%u -> %ux%u\n", Width, Height, Width * nShadowMapScale, Height * nShadowMapScale);
+		Width *= nShadowMapScale;
+		Height *= nShadowMapScale;
+		shadowUpscaled = true;
+	}
+
 	// SSAO needs a sampleable depth — but ONLY for the scene depth (matches/exceeds the back
-	// buffer), which is the one we cache and read in the shader. The game also creates small
-	// square depth surfaces (128/256/512) for its own reflection and projected-shadow passes;
-	// substituting INTZ there changed how the game rendered those passes and produced translucent
-	// ghost duplicates of characters. Leave non-scene depths in the game's native format.
-	bool sceneSizedDepth = ((int)Width >= nBackBufferWidth && (int)Height >= nBackBufferHeight);
+	// buffer), which is the one we cache and read in the shader. Small square depth surfaces
+	// (128/256/512) the game makes for reflection/projected-shadow passes keep the native format
+	// (INTZ there altered the game's own rendering). "!shadowUpscaled" guards the case where an
+	// upscaled 512->2048 shadow depth would otherwise pass the >= back buffer test.
+	bool sceneSizedDepth = (!shadowUpscaled && (int)Width >= nBackBufferWidth && (int)Height >= nBackBufferHeight);
 	if (bSSAO && g_intzSupported && sceneSizedDepth && ppSurface && MultiSample == D3DMULTISAMPLE_NONE && !pSharedHandle)
 	{
 		IDirect3DTexture9* intzTex = nullptr;
@@ -229,6 +253,20 @@ HRESULT m_IDirect3DDevice9Ex::CreateTexture(THIS_ UINT Width, UINT Height, UINT 
 	if (Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))
 		LogSurfaceCensus((Usage & D3DUSAGE_DEPTHSTENCIL) ? "TexDS" : "TexRT", Width, Height, (UINT)Format, Usage, (UINT)Pool, 0);
 
+	// Shadow-map upscaling: hand the game an NxN-times larger render target. SetViewport rescales
+	// the game's viewports on this target (it believes the original size); sampling needs no change
+	// (normalized UVs). EXPERIMENTAL — the same signature is reused for non-shadow RTs.
+	UINT reqW = Width, reqH = Height;
+	bool shadowUpscaled = false;
+	if (nShadowMapScale > 1 && (Usage & D3DUSAGE_RENDERTARGET) && Pool == D3DPOOL_DEFAULT
+		&& IsShadowMapSized(Width, Height))
+	{
+		WrapperLog("ShadowScale: TexRT %ux%u -> %ux%u\n", Width, Height, Width * nShadowMapScale, Height * nShadowMapScale);
+		Width *= nShadowMapScale;
+		Height *= nShadowMapScale;
+		shadowUpscaled = true;
+	}
+
 	bool eligible = (Levels == 1)
 		&& !(Usage & D3DUSAGE_DYNAMIC)
 		&& !(Usage & D3DUSAGE_RENDERTARGET)
@@ -252,11 +290,31 @@ HRESULT m_IDirect3DDevice9Ex::CreateTexture(THIS_ UINT Width, UINT Height, UINT 
 	if (FAILED(hr))
 		hr = ProxyInterface->CreateTexture(Width, Height, Levels, Usage, Format, Pool, ppTexture, pSharedHandle);
 
+	if (FAILED(hr) && shadowUpscaled)
+	{
+		WrapperLog("ShadowScale: %ux%u creation failed (hr=0x%08X), retrying original %ux%u\n",
+			Width, Height, (unsigned)hr, reqW, reqH);
+		Width = reqW;
+		Height = reqH;
+		shadowUpscaled = false;
+		hr = ProxyInterface->CreateTexture(Width, Height, Levels, Usage, Format, Pool, ppTexture, pSharedHandle);
+	}
+
 	if (SUCCEEDED(hr) && ppTexture)
 	{
-		auto* wrapper = new m_IDirect3DTexture9(*ppTexture, this);
+		IDirect3DTexture9* realTex = *ppTexture;
+		auto* wrapper = new m_IDirect3DTexture9(realTex, this);
 		if (needsMipRegen)
 			wrapper->SetNeedsMipRegen();
+		if (shadowUpscaled)
+		{
+			IDirect3DSurface9* s0 = nullptr;
+			if (SUCCEEDED(realTex->GetSurfaceLevel(0, &s0)) && s0)
+			{
+				TrackUpscaledRT(realTex, s0, reqW, reqH);
+				s0->Release(); // the texture keeps its level-0 surface alive
+			}
+		}
 		*ppTexture = wrapper;
 	}
 
@@ -364,6 +422,10 @@ HRESULT m_IDirect3DDevice9Ex::SetRenderTarget(THIS_ DWORD RenderTargetIndex, IDi
 	{
 		pRenderTarget = static_cast<m_IDirect3DSurface9 *>(pRenderTarget)->GetProxyInterface();
 	}
+
+	// Track whether RT0 is an upscaled shadow target so SetViewport can rescale accordingly.
+	if (RenderTargetIndex == 0)
+		g_curRTUpscaled = LookupUpscaledRT(pRenderTarget, &g_curRTOrigW, &g_curRTOrigH);
 
 	return ProxyInterface->SetRenderTarget(RenderTargetIndex, pRenderTarget);
 }
@@ -789,6 +851,27 @@ HRESULT m_IDirect3DDevice9Ex::GetViewport(D3DVIEWPORT9 *pViewport)
 
 HRESULT m_IDirect3DDevice9Ex::SetViewport(CONST D3DVIEWPORT9 *pViewport)
 {
+	// On an upscaled shadow target the game's original-sized viewport would cover only the
+	// top-left fraction. Rescale it — but only when it fits within the original size, so a
+	// viewport already expressed in upscaled coordinates passes through unchanged.
+	if (g_curRTUpscaled && pViewport
+		&& pViewport->X + pViewport->Width <= g_curRTOrigW
+		&& pViewport->Y + pViewport->Height <= g_curRTOrigH)
+	{
+		D3DVIEWPORT9 vp = *pViewport;
+		vp.X      *= nShadowMapScale;
+		vp.Y      *= nShadowMapScale;
+		vp.Width  *= nShadowMapScale;
+		vp.Height *= nShadowMapScale;
+		static bool s_logged = false;
+		if (!s_logged)
+		{
+			s_logged = true;
+			WrapperLog("ShadowScale: viewport %ux%u -> %ux%u (first hit)\n",
+				pViewport->Width, pViewport->Height, vp.Width, vp.Height);
+		}
+		return ProxyInterface->SetViewport(&vp);
+	}
 	return ProxyInterface->SetViewport(pViewport);
 }
 
@@ -1336,9 +1419,18 @@ HRESULT m_IDirect3DDevice9Ex::CreateDepthStencilSurfaceEx(THIS_ UINT Width, UINT
 {
 	LogSurfaceCensus("DSEx", Width, Height, (UINT)Format, Usage, D3DPOOL_DEFAULT, (UINT)MultiSample);
 
+	bool shadowUpscaled = false;
+	if (nShadowMapScale > 1 && MultiSample == D3DMULTISAMPLE_NONE && IsShadowMapSized(Width, Height))
+	{
+		WrapperLog("ShadowScale: DSEx %ux%u -> %ux%u\n", Width, Height, Width * nShadowMapScale, Height * nShadowMapScale);
+		Width *= nShadowMapScale;
+		Height *= nShadowMapScale;
+		shadowUpscaled = true;
+	}
+
 	// Scene-depth only — see CreateDepthStencilSurface for why small (reflection/shadow) depths
 	// must keep the game's native format.
-	bool sceneSizedDepth = ((int)Width >= nBackBufferWidth && (int)Height >= nBackBufferHeight);
+	bool sceneSizedDepth = (!shadowUpscaled && (int)Width >= nBackBufferWidth && (int)Height >= nBackBufferHeight);
 	if (bSSAO && g_intzSupported && sceneSizedDepth && ppSurface && MultiSample == D3DMULTISAMPLE_NONE && !pSharedHandle)
 	{
 		IDirect3DTexture9* intzTex = nullptr;

@@ -19,6 +19,7 @@
 
 extern void WrapperLog(const char* fmt, ...);
 extern int g_mipRegenCount;
+extern void UntrackUpscaledTexture(IDirect3DTexture9* realTex);
 
 HRESULT m_IDirect3DTexture9::QueryInterface(THIS_ REFIID riid, void** ppvObj)
 {
@@ -48,7 +49,12 @@ ULONG m_IDirect3DTexture9::AddRef(THIS)
 
 ULONG m_IDirect3DTexture9::Release(THIS)
 {
-	return ProxyInterface->Release();
+	ULONG r = ProxyInterface->Release();
+	// Drop any shadow-upscale tracking entry once the real texture is gone — a later allocation
+	// could reuse the same address and would otherwise inherit the viewport rescaling.
+	if (r == 0)
+		UntrackUpscaledTexture(ProxyInterface);
+	return r;
 }
 
 HRESULT m_IDirect3DTexture9::GetDevice(THIS_ IDirect3DDevice9** ppDevice)

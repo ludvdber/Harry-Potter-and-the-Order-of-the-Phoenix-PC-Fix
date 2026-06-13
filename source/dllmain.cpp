@@ -20,6 +20,7 @@
 #include "helpers.h"
 #include "IDirectInput8.h"
 #include <cstdio>
+#include <unordered_map>
 
 #pragma comment(lib, "d3dx9.lib")
 #pragma comment(lib, "winmm.lib") // needed for timeBeginPeriod()/timeEndPeriod()
@@ -120,6 +121,59 @@ int g_dsNullUnbindCount = 0;  // per-frame SetDepthStencilSurface(NULL) calls
 int g_dsSceneUnbindOnBB = 0;  // per-frame scene-depth unbinds while RT0 == back buffer
 int g_mipRegenCount = 0;      // cumulative successful mip-chain regenerations
 bool g_aoDoneThisFrame = false; // set when the depth-unbind AO pass ran this frame (option B)
+
+// ---- Shadow-map upscaling (ShadowMapScale > 1) ----
+// HP5 renders its projected shadows into small square X8R8G8B8 render-target textures
+// (128/256/512, paired with same-size depth — see the Census log lines). We hand the game an
+// NxN-times larger texture; since it believes the original size, every viewport it sets on that
+// target is scaled up by the same factor (SetViewport interception). Shadow lookups use
+// normalized UVs, so sampling needs no change. NOTE: the game reuses this same surface signature
+// for non-shadow render-to-texture (reflections/projected passes); we cannot tell them apart, so
+// this is EXPERIMENTAL — it may also upscale those. Default OFF in the shipped ini.
+int nShadowMapScale = 1;
+// Keyed by *real* (unwrapped) pointers. Single render thread — no locking needed for HP5.
+static std::unordered_map<IDirect3DSurface9*, std::pair<UINT, UINT>> g_upscaledRTBySurf; // surf -> original WxH
+static std::unordered_map<IDirect3DTexture9*, IDirect3DSurface9*> g_upscaledRTByTex;     // tex -> its level-0 surf
+bool g_curRTUpscaled = false; // RT0 currently bound is an upscaled shadow target
+UINT g_curRTOrigW = 0, g_curRTOrigH = 0;
+
+void TrackUpscaledRT(IDirect3DTexture9* realTex, IDirect3DSurface9* realSurf, UINT origW, UINT origH)
+{
+	g_upscaledRTBySurf[realSurf] = { origW, origH };
+	g_upscaledRTByTex[realTex] = realSurf;
+}
+
+// Called when the game fully releases an upscaled texture — the entry must go away, otherwise
+// a later allocation reusing the same address would be mistaken for a shadow target.
+void UntrackUpscaledTexture(IDirect3DTexture9* realTex)
+{
+	auto it = g_upscaledRTByTex.find(realTex);
+	if (it != g_upscaledRTByTex.end())
+	{
+		g_upscaledRTBySurf.erase(it->second);
+		g_upscaledRTByTex.erase(it);
+	}
+}
+
+bool LookupUpscaledRT(IDirect3DSurface9* realSurf, UINT* origW, UINT* origH)
+{
+	if (!realSurf) return false;
+	auto it = g_upscaledRTBySurf.find(realSurf);
+	if (it == g_upscaledRTBySurf.end()) return false;
+	*origW = it->second.first;
+	*origH = it->second.second;
+	return true;
+}
+
+// DEFAULT-pool resources are all released across a Reset/CreateDevice; anything still tracked
+// at that point is (about to be) a dangling key.
+void ClearUpscaledRTs()
+{
+	g_upscaledRTBySurf.clear();
+	g_upscaledRTByTex.clear();
+	g_curRTUpscaled = false;
+	g_curRTOrigW = g_curRTOrigH = 0;
+}
 
 char WinDir[MAX_PATH + 1];
 
@@ -822,6 +876,7 @@ extern void FreeFXAA();
 HRESULT m_IDirect3DDevice9Ex::Reset(D3DPRESENT_PARAMETERS* pPresentationParameters)
 {
 	FreeFXAA();
+	ClearUpscaledRTs();
 
 	if (bForceWindowedMode)
 		ForceWindowed(pPresentationParameters);
@@ -927,6 +982,7 @@ HRESULT m_IDirect3D9Ex::CreateDeviceEx(THIS_ UINT Adapter, D3DDEVTYPE DeviceType
 HRESULT m_IDirect3DDevice9Ex::ResetEx(THIS_ D3DPRESENT_PARAMETERS* pPresentationParameters, D3DDISPLAYMODEEX* pFullscreenDisplayMode)
 {
 	FreeFXAA();
+	ClearUpscaledRTs();
 
 	if (bForceWindowedMode)
 		ForceWindowed(pPresentationParameters, pFullscreenDisplayMode);
@@ -1508,6 +1564,9 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 			nSSAAFactor = GetPrivateProfileInt("GRAPHICS", "SSAAFactor", 1, path);
 			if (nSSAAFactor < 1) nSSAAFactor = 1;
 			if (nSSAAFactor > 4) nSSAAFactor = 4;
+			nShadowMapScale = GetPrivateProfileInt("GRAPHICS", "ShadowMapScale", 1, path);
+			if (nShadowMapScale < 1) nShadowMapScale = 1;
+			if (nShadowMapScale > 8) nShadowMapScale = 8;
 			bColorGrading = GetPrivateProfileInt("GRAPHICS", "ColorGrading", 1, path) != 0;
 			{
 				char szF[32];
@@ -1531,8 +1590,8 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 			WrapperLog("Ini: %s\n", path);
 			WrapperLog("  ForceWindowedMode=%d ForceWindowStyle=%d EnableHooks=%d DoNotNotify=%d\n",
 				bForceWindowedMode, nForceWindowStyle, bEnableHooks, bDoNotNotifyOnTaskSwitch);
-			WrapperLog("  Resolution=%dx%d  AF=%d  LODBias=%.2f  MSAA=%d  FXAA=%d  VSync=%d  SSAA=%dx\n",
-				nResolutionWidth, nResolutionHeight, nAnisotropicFiltering, fTextureLODBias, nAntialiasing, (int)bFXAA, (int)bVSync, nSSAAFactor);
+			WrapperLog("  Resolution=%dx%d  AF=%d  LODBias=%.2f  MSAA=%d  FXAA=%d  VSync=%d  SSAA=%dx  ShadowMapScale=%dx\n",
+				nResolutionWidth, nResolutionHeight, nAnisotropicFiltering, fTextureLODBias, nAntialiasing, (int)bFXAA, (int)bVSync, nSSAAFactor, nShadowMapScale);
 			WrapperLog("  ColorGrading=%d  Vibrance=%.2f  Vignette=%.2f  Lift=%.2f  Gamma=%.2f  Gain=%.2f\n",
 				(int)bColorGrading, fVibrance, fVignette, fLift, fGamma, fGain);
 			WrapperLog("  SSAO=%d  Strength=%.2f  Radius=%.1f  MinDelta=%.4f  MaxDelta=%.4f\n",
