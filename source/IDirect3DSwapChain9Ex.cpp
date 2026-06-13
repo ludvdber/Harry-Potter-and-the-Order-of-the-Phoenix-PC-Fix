@@ -18,6 +18,7 @@
 #include "d3dx9.h"
 
 extern bool bFXAA;
+extern float fSharpness;
 extern bool bColorGrading;
 extern float fVibrance;
 extern float fVignette;
@@ -125,19 +126,32 @@ float4 main(float2 uv:TEXCOORD0):COLOR0{
     float lNW=luma(nw),lNE=luma(ne),lSW=luma(sw),lSE=luma(se),lM=luma(m);
     float lMin=min(lM,min(min(lNW,lNE),min(lSW,lSE)));
     float lMax=max(lM,max(max(lNW,lNE),max(lSW,lSE)));
-    float3 result;
-    if((lMax-lMin)<max(0.0625,lMax*0.125)){
-        result = clamp(m+(m-avg)*0.40,0,1);
-    } else {
-        float2 dir=float2(-((lNW+lNE)-(lSW+lSE)),(lNW+lSW)-(lNE+lSE));
-        float rcp=1.0/(min(abs(dir.x),abs(dir.y))+max((lNW+lNE+lSW+lSE)*0.03125,0.0078125));
-        dir=clamp(dir*rcp,-12,12)*o;
-        float3 A=0.5*(tex2D(scene,uv+dir*(1.0/3.0-0.5)).rgb+tex2D(scene,uv+dir*(2.0/3.0-0.5)).rgb);
-        float3 B=A*0.5+0.25*(tex2D(scene,uv-dir*0.5).rgb+tex2D(scene,uv+dir*0.5).rgb);
-        float lB=luma(B);
-        result = lB<lMin||lB>lMax?A:B;
-    }
-    result *= ssaoFactor(uv, lMax - lMin);
+    float range = lMax - lMin;
+    float thresh = max(0.0625, lMax*0.125);
+    // --- sharpen candidate (flat-detail enhancement, strength = grade2.y from ini Sharpness) ---
+    // Overshoot-limited unsharp mask. Plain (m-avg)*amount paints a bright/dark 1px fringe at
+    // medium-contrast edges (the "extra pixel on the width" the user reported); clamping the
+    // result to the local neighbourhood +/- a small slack keeps real sharpening but forbids the
+    // fringe from exceeding what the surrounding pixels already span.
+    float3 nbHi = max(max(nw,ne),max(sw,se));
+    float3 nbLo = min(min(nw,ne),min(sw,se));
+    float3 sharp = clamp(m + (m-avg)*grade2.y, nbLo - 0.05, nbHi + 0.05);
+    // --- FXAA candidate ---
+    float2 dir=float2(-((lNW+lNE)-(lSW+lSE)),(lNW+lSW)-(lNE+lSE));
+    float rcp=1.0/(min(abs(dir.x),abs(dir.y))+max((lNW+lNE+lSW+lSE)*0.03125,0.0078125));
+    dir=clamp(dir*rcp,-12,12)*o;
+    float3 A=0.5*(tex2D(scene,uv+dir*(1.0/3.0-0.5)).rgb+tex2D(scene,uv+dir*(2.0/3.0-0.5)).rgb);
+    float3 B=A*0.5+0.25*(tex2D(scene,uv-dir*0.5).rgb+tex2D(scene,uv+dir*0.5).rgb);
+    float lB=luma(B);
+    float3 fxaa = (lB<lMin||lB>lMax)?A:B;
+    // --- smooth blend instead of a hard flat/edge branch ---
+    // The old binary `if(range<thresh)` made pixels sitting on the threshold flip between
+    // sharpened and FXAA'd from frame to frame as scene luma changed (e.g. a flickering torch),
+    // so the edge fringe appeared to crawl even with a still camera. A smoothstep transition
+    // removes the toggle: which path a pixel takes no longer flips on a tiny luma change.
+    float edge = smoothstep(thresh*0.6, thresh*1.4, range);
+    float3 result = lerp(sharp, fxaa, edge);
+    result *= ssaoFactor(uv, range);
     return float4(grade(result, uv), 1);
 }
 )";
@@ -373,9 +387,11 @@ static void ApplyFXAA(IDirect3DDevice9* dev, IDirect3DSurface9* pBB)
     dev->SetSamplerState(0, D3DSAMP_ADDRESSV,   D3DTADDRESS_CLAMP);
     float rcpF[4] = { 1.0f / s_fxaaW, 1.0f / s_fxaaH, (float)s_fxaaW, (float)s_fxaaH };
     dev->SetPixelShaderConstantF(0, rcpF, 1);
-    // c1 = (lift, gamma, gain, vibrance), c2 = (vignette, _, _, _). Neutral when ColorGrading=0.
+    // c1 = (lift, gamma, gain, vibrance), c2 = (vignette, sharpness, _, _). Neutral when
+    // ColorGrading=0, but sharpness rides in c2.y independently — it is part of the FXAA pass,
+    // not grading, so it applies whenever FXAA is on.
     float grade1[4] = { 0.0f, 1.0f, 1.0f, 0.0f };
-    float grade2[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float grade2[4] = { 0.0f, fSharpness, 0.0f, 0.0f };
     if (bColorGrading)
     {
         grade1[0] = fLift;

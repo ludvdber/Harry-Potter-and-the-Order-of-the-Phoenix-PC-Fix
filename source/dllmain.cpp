@@ -90,6 +90,7 @@ int nResolutionHeight;
 int nBackBufferWidth = 0;
 int nBackBufferHeight = 0;
 bool bFXAA;
+float fSharpness = 0.25f;
 int nSSAAFactor = 1;
 bool bColorGrading;
 float fVibrance;
@@ -1575,6 +1576,9 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 				GetPrivateProfileStringA("GRAPHICS", "Lift",      "0.00", szF, sizeof(szF), path); fLift     = (float)atof(szF);
 				GetPrivateProfileStringA("GRAPHICS", "Gamma",     "1.00", szF, sizeof(szF), path); fGamma    = (float)atof(szF);
 				GetPrivateProfileStringA("GRAPHICS", "Gain",      "1.05", szF, sizeof(szF), path); fGain     = (float)atof(szF);
+					GetPrivateProfileStringA("GRAPHICS", "Sharpness", "0.25", szF, sizeof(szF), path); fSharpness = (float)atof(szF);
+					if (fSharpness < 0.0f) fSharpness = 0.0f;
+					if (fSharpness > 1.0f) fSharpness = 1.0f;
 			}
 			bSSAO = GetPrivateProfileInt("GRAPHICS", "SSAO", 0, path) != 0;
 			{
@@ -1590,8 +1594,8 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 			WrapperLog("Ini: %s\n", path);
 			WrapperLog("  ForceWindowedMode=%d ForceWindowStyle=%d EnableHooks=%d DoNotNotify=%d\n",
 				bForceWindowedMode, nForceWindowStyle, bEnableHooks, bDoNotNotifyOnTaskSwitch);
-			WrapperLog("  Resolution=%dx%d  AF=%d  LODBias=%.2f  MSAA=%d  FXAA=%d  VSync=%d  SSAA=%dx  ShadowMapScale=%dx\n",
-				nResolutionWidth, nResolutionHeight, nAnisotropicFiltering, fTextureLODBias, nAntialiasing, (int)bFXAA, (int)bVSync, nSSAAFactor, nShadowMapScale);
+			WrapperLog("  Resolution=%dx%d  AF=%d  LODBias=%.2f  MSAA=%d  FXAA=%d  Sharpness=%.2f  VSync=%d  SSAA=%dx  ShadowMapScale=%dx\n",
+				nResolutionWidth, nResolutionHeight, nAnisotropicFiltering, fTextureLODBias, nAntialiasing, (int)bFXAA, fSharpness, (int)bVSync, nSSAAFactor, nShadowMapScale);
 			WrapperLog("  ColorGrading=%d  Vibrance=%.2f  Vignette=%.2f  Lift=%.2f  Gamma=%.2f  Gain=%.2f\n",
 				(int)bColorGrading, fVibrance, fVignette, fLift, fGamma, fGain);
 			WrapperLog("  SSAO=%d  Strength=%.2f  Radius=%.1f  MinDelta=%.4f  MaxDelta=%.4f\n",
