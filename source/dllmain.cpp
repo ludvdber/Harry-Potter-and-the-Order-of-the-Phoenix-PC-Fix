@@ -35,6 +35,18 @@ void WrapperLog(const char* fmt, ...)
 	fflush(g_log);
 }
 
+// Surface-creation census for the shadow-map investigation: log every render-target / depth
+// surface the game creates so shadow-map candidates (small square depth targets recreated per
+// level) can be identified from the log. Capped — the interesting creations happen at startup
+// and level loads; a per-frame allocator would otherwise flood the file.
+void LogSurfaceCensus(const char* kind, UINT W, UINT H, UINT fmt, DWORD usage, UINT pool, UINT msaa)
+{
+	static int s_lines = 0;
+	if (s_lines > 400) return;
+	if (++s_lines > 400) { WrapperLog("Census: 400-line cap reached, further surface creations not logged\n"); return; }
+	WrapperLog("Census %-6s %ux%u fmt=0x%X usage=0x%X pool=%u msaa=%u\n", kind, W, H, fmt, usage, pool, msaa);
+}
+
 Direct3DShaderValidatorCreate9Proc m_pDirect3DShaderValidatorCreate9;
 PSGPErrorProc m_pPSGPError;
 PSGPSampleTextureProc m_pPSGPSampleTexture;
@@ -89,10 +101,25 @@ float fSSAOStrength;
 float fSSAORadius;
 float fSSAOMinDelta;
 float fSSAOMaxDelta;
+int nScreenshotKey;
 bool  g_intzChecked = false;
 bool  g_intzSupported = false;
 IDirect3DTexture9* g_sceneDepthTex = nullptr;
 UINT  g_sceneDepthW = 0, g_sceneDepthH = 0;
+// Diagnostics shared with IDirect3DDevice9Ex.cpp. g_sceneDepthSurf/g_curDepthReal are raw
+// compare-only pointers (no ref held — g_sceneDepthTex's ref keeps the surface alive).
+IDirect3DSurface9* g_sceneDepthSurf = nullptr;
+IDirect3DSurface9* g_curDepthReal = nullptr;
+// Dimensions of the render target the game binds alongside the scene depth. After a Reset the
+// game can create a window-sized depth surface (e.g. 2560x1440) while our back buffer stays at
+// the ini resolution — the depth content then only fills the RT-sized top-left region, and the
+// SSAO shader must scale its UVs by RT/depth to sample it correctly.
+UINT g_sceneDepthRTW = 0, g_sceneDepthRTH = 0;
+int g_dsBindCount = 0;        // per-frame SetDepthStencilSurface(non-null) calls
+int g_dsNullUnbindCount = 0;  // per-frame SetDepthStencilSurface(NULL) calls
+int g_dsSceneUnbindOnBB = 0;  // per-frame scene-depth unbinds while RT0 == back buffer
+int g_mipRegenCount = 0;      // cumulative successful mip-chain regenerations
+bool g_aoDoneThisFrame = false; // set when the depth-unbind AO pass ran this frame (option B)
 
 char WinDir[MAX_PATH + 1];
 
@@ -266,6 +293,96 @@ FrameLimiter::FPSLimitMode mFPSLimitMode = FrameLimiter::FPSLimitMode::FPS_NONE;
 
 extern void DeviceFXAAPresent(IDirect3DDevice9* dev);
 
+// Screenshot hotkey (ini [MAIN] ScreenshotKey, default F12, 0 = off). Runs after the FXAA pass
+// so the PNG shows exactly what reaches the screen, post-processing included. Exists because
+// OS-level capture (Win+PrtScr) is unreliable over this game's input handling.
+static void MaybeTakeScreenshot(IDirect3DDevice9* dev)
+{
+	if (!nScreenshotKey)
+		return;
+	static bool s_wasDown = false;
+	bool down = (GetAsyncKeyState(nScreenshotKey) & 0x8000) != 0;
+	bool fire = down && !s_wasDown;
+	s_wasDown = down;
+	if (!fire)
+		return;
+
+	IDirect3DSurface9* bb = nullptr;
+	if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb)
+		return;
+	D3DSURFACE_DESC desc;
+	bb->GetDesc(&desc);
+
+	// The back buffer can be multisampled (MSAA) — not lockable/saveable directly.
+	// StretchRect into a plain render target performs the resolve.
+	IDirect3DSurface9* tmp = nullptr;
+	if (SUCCEEDED(dev->CreateRenderTarget(desc.Width, desc.Height, desc.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &tmp, nullptr)) && tmp
+		&& SUCCEEDED(dev->StretchRect(bb, nullptr, tmp, nullptr, D3DTEXF_NONE)))
+	{
+		char dir[MAX_PATH];
+		GetModuleFileNameA(g_hWrapperModule, dir, MAX_PATH);
+		strcpy(strrchr(dir, '\\'), "\\screenshots");
+		CreateDirectoryA(dir, nullptr);
+		SYSTEMTIME st;
+		GetLocalTime(&st);
+		char file[MAX_PATH];
+		_snprintf(file, MAX_PATH, "%s\\hp5_%04u%02u%02u_%02u%02u%02u.png", dir,
+			st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+		HRESULT hr = D3DXSaveSurfaceToFileA(file, D3DXIFF_PNG, tmp, nullptr, nullptr);
+		if (SUCCEEDED(hr))
+			WrapperLog("Screenshot saved: %s\n", file);
+		else
+			WrapperLog("Screenshot FAILED (hr=0x%08X): %s\n", (unsigned)hr, file);
+	}
+	if (tmp) tmp->Release();
+	bb->Release();
+}
+
+// Frame diagnostics: reports the per-frame depth bind/unbind structure (data needed to decide
+// whether the future "AO at depth-unbind" pass is viable) plus cumulative health counters.
+// Detailed lines for the 10 frames after the scene depth texture first appears, then one
+// summary line every 1800 presents so a long session stays readable.
+static void PresentDiagTick()
+{
+	static unsigned s_frame = 0;
+	static unsigned s_winBinds = 0, s_winNull = 0, s_winSceneBB = 0;
+	static int s_detail = 0;
+	static IDirect3DTexture9* s_lastDepthTex = nullptr;
+
+	s_frame++;
+	s_winBinds += g_dsBindCount;
+	s_winNull += g_dsNullUnbindCount;
+	s_winSceneBB += g_dsSceneUnbindOnBB;
+
+	if (g_sceneDepthTex != s_lastDepthTex)
+	{
+		s_lastDepthTex = g_sceneDepthTex;
+		if (g_sceneDepthTex)
+		{
+			s_detail = 10;
+			WrapperLog("Diag: scene depth texture appeared (%ux%u), detailing next 10 frames\n", g_sceneDepthW, g_sceneDepthH);
+		}
+	}
+
+	if (s_detail > 0)
+	{
+		s_detail--;
+		WrapperLog("Diag frame %u: dsBinds=%d dsNullUnbinds=%d sceneDepthUnbinds(RT=backbuffer)=%d\n",
+			s_frame, g_dsBindCount, g_dsNullUnbindCount, g_dsSceneUnbindOnBB);
+	}
+	else if (s_frame % 1800 == 0)
+	{
+		WrapperLog("Diag @%u frames: avg/frame dsBinds=%.1f dsNullUnbinds=%.1f sceneUnbindsOnBB=%.1f | mipRegen total=%d | sceneDepth=%s\n",
+			s_frame, s_winBinds / 1800.0, s_winNull / 1800.0, s_winSceneBB / 1800.0,
+			g_mipRegenCount, g_sceneDepthTex ? "cached" : "none");
+		s_winBinds = s_winNull = s_winSceneBB = 0;
+	}
+
+	g_dsBindCount = g_dsNullUnbindCount = g_dsSceneUnbindOnBB = 0;
+	// Re-arm the depth-unbind AO pass for the next frame.
+	g_aoDoneThisFrame = false;
+}
+
 HRESULT m_IDirect3DDevice9Ex::Present(CONST RECT* pSourceRect, CONST RECT* pDestRect, HWND hDestWindowOverride, CONST RGNDATA* pDirtyRegion)
 {
 	if (mFPSLimitMode == FrameLimiter::FPSLimitMode::FPS_REALTIME)
@@ -274,6 +391,8 @@ HRESULT m_IDirect3DDevice9Ex::Present(CONST RECT* pSourceRect, CONST RECT* pDest
 		while (!FrameLimiter::Sync_SLP());
 
 	DeviceFXAAPresent(ProxyInterface);
+	MaybeTakeScreenshot(ProxyInterface);
+	PresentDiagTick();
 	return ProxyInterface->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
 }
 
@@ -285,6 +404,8 @@ HRESULT m_IDirect3DDevice9Ex::PresentEx(THIS_ CONST RECT* pSourceRect, CONST REC
 		while (!FrameLimiter::Sync_SLP());
 
 	DeviceFXAAPresent(ProxyInterface);
+	MaybeTakeScreenshot(ProxyInterface);
+	PresentDiagTick();
 	return ProxyInterface->PresentEx(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, dwFlags);
 }
 
@@ -419,6 +540,8 @@ void ForceWindowed(D3DPRESENT_PARAMETERS* pPresentationParameters, D3DDISPLAYMOD
 					{
 						WndProcList.emplace_back(wClassAtom, wndproc);
 						SetWindowLongPtr(hwnd, GWLP_WNDPROC, IsWindowUnicode(hwnd) ? (LONG_PTR)CustomWndProcW : (LONG_PTR)CustomWndProcA);
+						WrapperLog("ForceWindowed: wndproc subclassed (focus-loss swallowing %s)\n",
+							bDoNotNotifyOnTaskSwitch ? "armed" : "off");
 					}
 				}
 			}
@@ -502,11 +625,42 @@ void ApplyGraphicsSettings(D3DPRESENT_PARAMETERS* pPresentationParameters)
 		pPresentationParameters->AutoDepthStencilFormat = D3DFMT_INTZ;
 	}
 
-	if (nResolutionWidth > 0 && nResolutionHeight > 0)
+	// Width/Height = -1: render at the native resolution of the monitor hosting the game window
+	// (no driver upscale blur in borderless mode). Re-queried at every CreateDevice/Reset so a
+	// monitor change is picked up.
+	int resW = nResolutionWidth, resH = nResolutionHeight;
+	if (resW == -1 || resH == -1)
 	{
-		pPresentationParameters->BackBufferWidth = nResolutionWidth;
-		pPresentationParameters->BackBufferHeight = nResolutionHeight;
-		WrapperLog("ApplyGraphicsSettings: overriding resolution to %dx%d\n", nResolutionWidth, nResolutionHeight);
+		HWND hwnd = pPresentationParameters->hDeviceWindow ? pPresentationParameters->hDeviceWindow : g_hFocusWindow;
+		HMONITOR monitor = MonitorFromWindow((!bUsePrimaryMonitor && hwnd) ? hwnd : GetDesktopWindow(), MONITOR_DEFAULTTONEAREST);
+		MONITORINFOEXA info;
+		info.cbSize = sizeof(info);
+		if (GetMonitorInfoA(monitor, (LPMONITORINFO)&info))
+		{
+			// EnumDisplaySettings reports the physical display mode — immune to DPI
+			// virtualization, which shrinks rcMonitor for non-DPI-aware processes
+			// (2560x1440 at 160% Windows scaling reads as 1600x900 otherwise).
+			DEVMODEA dm = {};
+			dm.dmSize = sizeof(dm);
+			if (EnumDisplaySettingsA(info.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmPelsWidth && dm.dmPelsHeight)
+			{
+				resW = (int)dm.dmPelsWidth;
+				resH = (int)dm.dmPelsHeight;
+			}
+			else
+			{
+				resW = info.rcMonitor.right - info.rcMonitor.left;
+				resH = info.rcMonitor.bottom - info.rcMonitor.top;
+			}
+			WrapperLog("ApplyGraphicsSettings: native resolution detected: %dx%d\n", resW, resH);
+		}
+	}
+
+	if (resW > 0 && resH > 0)
+	{
+		pPresentationParameters->BackBufferWidth = resW;
+		pPresentationParameters->BackBufferHeight = resH;
+		WrapperLog("ApplyGraphicsSettings: overriding resolution to %dx%d\n", resW, resH);
 	}
 
 	// SSAA: gonfle le back buffer; le driver fait le bilinear downsample au Present (windowed mode).
@@ -844,10 +998,16 @@ LRESULT WINAPI CustomWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
 			// On focus return, force DI8 mouse re-Acquire — the game's polling otherwise
 			// stays in a "ghost acquired" state and the cursor stops responding.
 			if (wParam == TRUE)
+			{
+				WrapperLog("AltTab: WM_ACTIVATEAPP(TRUE) received, re-acquiring mice\n");
 				DirectInputReAcquireMice();
+			}
 			// Swallow the deactivation message to prevent HP5's freeze on focus loss.
 			if (bDoNotNotifyOnTaskSwitch && wParam == FALSE)
+			{
+				WrapperLog("AltTab: WM_ACTIVATEAPP(FALSE) swallowed\n");
 				return 0;
+			}
 			if (bCaptureMouse && wParam == TRUE)
 				CaptureMouse(hWnd);
 			break;
@@ -1306,10 +1466,28 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 			GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&Direct3DCreate9, &hm);
 			GetModuleFileNameA(hm, path, sizeof(path));
 			strcpy(strrchr(path, '\\'), "\\d3d9.ini");
+			// Opt out of Windows DPI scaling before the game creates its window. Without this,
+			// display scaling (e.g. 160% on a 1440p laptop screen) makes the borderless window
+			// undersized-then-DWM-stretched (extra blur) and lies to GetMonitorInfo about the
+			// desktop size. Must run at DLL attach — the game's window doesn't exist yet.
+			if (GetPrivateProfileInt("MAIN", "DPIAware", 1, path) != 0)
+			{
+				typedef BOOL(WINAPI* SetDpiCtx_fn)(HANDLE);
+				HMODULE user32 = GetModuleHandleA("user32.dll");
+				SetDpiCtx_fn pSetCtx = user32 ? (SetDpiCtx_fn)GetProcAddress(user32, "SetProcessDpiAwarenessContext") : nullptr;
+				BOOL dpiOk = FALSE;
+				if (pSetCtx)
+					dpiOk = pSetCtx((HANDLE)-4); // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (Win10 1703+)
+				if (!dpiOk)
+					dpiOk = SetProcessDPIAware(); // Vista+ fallback (system-DPI aware)
+				WrapperLog("DPIAware: %s\n", dpiOk ? "enabled (DPI virtualization off)" : "FAILED");
+			}
+
 			bForceWindowedMode = GetPrivateProfileInt("MAIN", "ForceWindowedMode", 0, path) != 0;
 			fFPSLimit = static_cast<float>(GetPrivateProfileInt("MAIN", "FPSLimit", 0, path));
 			nFullScreenRefreshRateInHz = GetPrivateProfileInt("MAIN", "FullScreenRefreshRateInHz", 0, path);
 			bDisplayFPSCounter = GetPrivateProfileInt("MAIN", "DisplayFPSCounter", 0, path);
+			nScreenshotKey = GetPrivateProfileInt("MAIN", "ScreenshotKey", VK_F12, path);
 			bEnableHooks = GetPrivateProfileInt("MAIN", "EnableHooks", 0, path);
 			bUsePrimaryMonitor = GetPrivateProfileInt("FORCEWINDOWED", "UsePrimaryMonitor", 0, path) != 0;
 			bCenterWindow = GetPrivateProfileInt("FORCEWINDOWED", "CenterWindow", 1, path) != 0;
@@ -1362,12 +1540,15 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 
 			if (fFPSLimit > 0.0f)
 			{
-				FrameLimiter::FPSLimitMode mode = (GetPrivateProfileInt("MAIN", "FPSLimitMode", 1, path) == 2) ? FrameLimiter::FPSLimitMode::FPS_ACCURATE : FrameLimiter::FPSLimitMode::FPS_REALTIME;
+				// Default matches data/d3d9.ini: ACCURATE (sleep-yield). REALTIME busy-waits a full core.
+				FrameLimiter::FPSLimitMode mode = (GetPrivateProfileInt("MAIN", "FPSLimitMode", 2, path) == 1) ? FrameLimiter::FPSLimitMode::FPS_REALTIME : FrameLimiter::FPSLimitMode::FPS_ACCURATE;
 				if (mode == FrameLimiter::FPSLimitMode::FPS_ACCURATE)
 					timeBeginPeriod(1);
 
 				FrameLimiter::Init(mode);
 				mFPSLimitMode = mode;
+				WrapperLog("FrameLimiter: %.0f fps, mode=%s\n", fFPSLimit,
+					mode == FrameLimiter::FPSLimitMode::FPS_ACCURATE ? "ACCURATE (sleep-yield)" : "REALTIME (busy-wait)");
 			}
 			else
 				mFPSLimitMode = FrameLimiter::FPSLimitMode::FPS_NONE;

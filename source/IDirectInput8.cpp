@@ -74,10 +74,13 @@ static void UntrackDeviceW(LPDIRECTINPUTDEVICE8W dev)
 void DirectInputReAcquireMice()
 {
 	if (!g_diLockInit) return;
+	int n = 0, ok = 0;
 	EnterCriticalSection(&g_diLock);
-	for (auto& p : g_diDevsA) if (p.second == DIK_Mouse_Or_Other) { p.first->Unacquire(); p.first->Acquire(); }
-	for (auto& p : g_diDevsW) if (p.second == DIK_Mouse_Or_Other) { p.first->Unacquire(); p.first->Acquire(); }
+	for (auto& p : g_diDevsA) if (p.second == DIK_Mouse_Or_Other) { n++; p.first->Unacquire(); if (SUCCEEDED(p.first->Acquire())) ok++; }
+	for (auto& p : g_diDevsW) if (p.second == DIK_Mouse_Or_Other) { n++; p.first->Unacquire(); if (SUCCEEDED(p.first->Acquire())) ok++; }
 	LeaveCriticalSection(&g_diLock);
+	// Fires once per Alt+Tab return — cheap to log, confirms mouse recovery is working.
+	WrapperLog("DirectInput: re-acquired mice %d/%d ok\n", ok, n);
 }
 
 // ---- m_IDirectInputDevice8A ----
@@ -235,7 +238,9 @@ HRESULT m_IDirectInput8A::CreateDevice(REFGUID rguid, LPDIRECTINPUTDEVICE8A* lpl
 	if (SUCCEEDED(hr) && lplpDirectInputDevice && *lplpDirectInputDevice)
 	{
 		LPDIRECTINPUTDEVICE8A underlying = *lplpDirectInputDevice;
-		TrackDeviceA(underlying, ClassifyDeviceGuid(rguid));
+		DIKind kind = ClassifyDeviceGuid(rguid);
+		TrackDeviceA(underlying, kind);
+		WrapperLog("DirectInput[A]: device wrapped (%s)\n", kind == DIK_Keyboard ? "keyboard" : "mouse/other");
 		*lplpDirectInputDevice = new m_IDirectInputDevice8A(underlying);
 	}
 	return hr;
@@ -265,7 +270,9 @@ HRESULT m_IDirectInput8W::CreateDevice(REFGUID rguid, LPDIRECTINPUTDEVICE8W* lpl
 	if (SUCCEEDED(hr) && lplpDirectInputDevice && *lplpDirectInputDevice)
 	{
 		LPDIRECTINPUTDEVICE8W underlying = *lplpDirectInputDevice;
-		TrackDeviceW(underlying, ClassifyDeviceGuid(rguid));
+		DIKind kind = ClassifyDeviceGuid(rguid);
+		TrackDeviceW(underlying, kind);
+		WrapperLog("DirectInput[W]: device wrapped (%s)\n", kind == DIK_Keyboard ? "keyboard" : "mouse/other");
 		*lplpDirectInputDevice = new m_IDirectInputDevice8W(underlying);
 	}
 	return hr;
@@ -298,7 +305,11 @@ void InstallDirectInputHook()
 {
 	HMODULE mainModule = GetModuleHandleA(nullptr);
 	HMODULE dinput8 = GetModuleHandleA("dinput8.dll");
-	if (!dinput8) return; // host doesn't use DI8, nothing to do
+	if (!dinput8)
+	{
+		WrapperLog("DirectInput: dinput8.dll not loaded at attach, hook skipped\n");
+		return; // host doesn't use DI8, nothing to do
+	}
 
 	auto originals = IATHook::Replace(
 		mainModule, "dinput8.dll",
@@ -310,4 +321,6 @@ void InstallDirectInputHook()
 		oDirectInput8Create = (DirectInput8Create_fn)it->second.get();
 	else
 		oDirectInput8Create = (DirectInput8Create_fn)GetProcAddress(dinput8, "DirectInput8Create");
+
+	WrapperLog("DirectInput: DirectInput8Create hook %s\n", oDirectInput8Create ? "installed" : "FAILED to resolve");
 }

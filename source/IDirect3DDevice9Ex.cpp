@@ -26,10 +26,20 @@ extern bool g_intzSupported;
 extern IDirect3DTexture9* g_sceneDepthTex;
 extern UINT  g_sceneDepthW;
 extern UINT  g_sceneDepthH;
+extern IDirect3DSurface9* g_sceneDepthSurf;
+extern IDirect3DSurface9* g_curDepthReal;
+extern UINT g_sceneDepthRTW;
+extern UINT g_sceneDepthRTH;
+extern bool g_aoDoneThisFrame;
+extern void DeviceSSAOAtUnbind(IDirect3DDevice9* dev);
+extern int g_dsBindCount;
+extern int g_dsNullUnbindCount;
+extern int g_dsSceneUnbindOnBB;
 #ifndef D3DFMT_INTZ
 #define D3DFMT_INTZ ((D3DFORMAT)MAKEFOURCC('I','N','T','Z'))
 #endif
 extern void WrapperLog(const char* fmt, ...);
+extern void LogSurfaceCensus(const char* kind, UINT W, UINT H, UINT fmt, DWORD usage, UINT pool, UINT msaa);
 
 HRESULT m_IDirect3DDevice9Ex::QueryInterface(REFIID riid, void** ppvObj)
 {
@@ -113,6 +123,9 @@ HRESULT m_IDirect3DDevice9Ex::CreateAdditionalSwapChain(D3DPRESENT_PARAMETERS *p
 
 HRESULT m_IDirect3DDevice9Ex::CreateCubeTexture(THIS_ UINT EdgeLength, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DCubeTexture9** ppCubeTexture, HANDLE* pSharedHandle)
 {
+	if (Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))
+		LogSurfaceCensus("CubeRT", EdgeLength, EdgeLength, (UINT)Format, Usage, (UINT)Pool, 0);
+
 	HRESULT hr = ProxyInterface->CreateCubeTexture(EdgeLength, Levels, Usage, Format, Pool, ppCubeTexture, pSharedHandle);
 
 	if (SUCCEEDED(hr) && ppCubeTexture)
@@ -125,9 +138,15 @@ HRESULT m_IDirect3DDevice9Ex::CreateCubeTexture(THIS_ UINT EdgeLength, UINT Leve
 
 HRESULT m_IDirect3DDevice9Ex::CreateDepthStencilSurface(THIS_ UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Discard, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle)
 {
-	// SSAO needs a sampleable depth. Replace the requested D24S8/D32 surface with a level-0 surface
-	// of an INTZ texture, which behaves identically as a depth-stencil target but is also sampleable.
-	if (bSSAO && g_intzSupported && ppSurface && MultiSample == D3DMULTISAMPLE_NONE && !pSharedHandle)
+	LogSurfaceCensus("DS", Width, Height, (UINT)Format, 0, D3DPOOL_DEFAULT, (UINT)MultiSample);
+
+	// SSAO needs a sampleable depth — but ONLY for the scene depth (matches/exceeds the back
+	// buffer), which is the one we cache and read in the shader. The game also creates small
+	// square depth surfaces (128/256/512) for its own reflection and projected-shadow passes;
+	// substituting INTZ there changed how the game rendered those passes and produced translucent
+	// ghost duplicates of characters. Leave non-scene depths in the game's native format.
+	bool sceneSizedDepth = ((int)Width >= nBackBufferWidth && (int)Height >= nBackBufferHeight);
+	if (bSSAO && g_intzSupported && sceneSizedDepth && ppSurface && MultiSample == D3DMULTISAMPLE_NONE && !pSharedHandle)
 	{
 		IDirect3DTexture9* intzTex = nullptr;
 		HRESULT hrTex = ProxyInterface->CreateTexture(Width, Height, 1, D3DUSAGE_DEPTHSTENCIL,
@@ -140,15 +159,21 @@ HRESULT m_IDirect3DDevice9Ex::CreateDepthStencilSurface(THIS_ UINT Width, UINT H
 			{
 				WrapperLog("CreateDepthStencilSurface: %ux%u game_fmt=0x%X -> INTZ texture-backed surface\n",
 					Width, Height, (UINT)Format);
-				// If this depth surface matches the back buffer dimensions, it's the main scene depth.
+				// A depth surface at least as large as the back buffer is the main scene depth.
+				// ">=" and not "==": after a Reset the game sizes its depth to the *window*
+				// (e.g. 2560x1440 borderless on a 1440p desktop) while our back buffer stays at
+				// the ini resolution — an exact match would silently kill SSAO for the session.
 				// Cache the texture so SSAO can sample it even when the game unbinds depth before Present.
-				if ((int)Width == nBackBufferWidth && (int)Height == nBackBufferHeight)
+				if ((int)Width >= nBackBufferWidth && (int)Height >= nBackBufferHeight)
 				{
 					if (g_sceneDepthTex) g_sceneDepthTex->Release();
 					intzTex->AddRef();
 					g_sceneDepthTex = intzTex;
+					g_sceneDepthSurf = intzSurf;
 					g_sceneDepthW = Width;
 					g_sceneDepthH = Height;
+					// Unknown until the game binds it — re-measured per cached depth.
+					g_sceneDepthRTW = g_sceneDepthRTH = 0;
 					WrapperLog("  -> cached as g_sceneDepthTex for SSAO\n");
 				}
 				intzTex->Release(); // surface internally holds a ref to the parent texture
@@ -183,6 +208,8 @@ HRESULT m_IDirect3DDevice9Ex::CreateIndexBuffer(THIS_ UINT Length, DWORD Usage, 
 
 HRESULT m_IDirect3DDevice9Ex::CreateRenderTarget(THIS_ UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Lockable, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle)
 {
+	LogSurfaceCensus("RT", Width, Height, (UINT)Format, 0, D3DPOOL_DEFAULT, (UINT)MultiSample);
+
 	HRESULT hr = ProxyInterface->CreateRenderTarget(Width, Height, Format, MultiSample, MultisampleQuality, Lockable, ppSurface, pSharedHandle);
 	if (SUCCEEDED(hr) && ppSurface)
 	{
@@ -199,6 +226,9 @@ HRESULT m_IDirect3DDevice9Ex::CreateTexture(THIS_ UINT Width, UINT Height, UINT 
 	// high-quality mipmaps after the game uploads level 0. This is applied to all formats
 	// (including DXT) because GPU AUTOGENMIPMAP produces degraded results for compressed textures
 	// and inconsistent results across drivers even for uncompressed ones.
+	if (Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))
+		LogSurfaceCensus((Usage & D3DUSAGE_DEPTHSTENCIL) ? "TexDS" : "TexRT", Width, Height, (UINT)Format, Usage, (UINT)Pool, 0);
+
 	bool eligible = (Levels == 1)
 		&& !(Usage & D3DUSAGE_DYNAMIC)
 		&& !(Usage & D3DUSAGE_RENDERTARGET)
@@ -673,6 +703,13 @@ HRESULT m_IDirect3DDevice9Ex::SetTexture(DWORD Stage, IDirect3DBaseTexture9 *pTe
 		}
 		if (nAnisotropicFiltering > 0)
 		{
+			static bool s_loggedAF = false;
+			if (!s_loggedAF)
+			{
+				s_loggedAF = true;
+				WrapperLog("AF: forcing trilinear + anisotropic x%d on all samplers (first hit: stage %u)\n",
+					nAnisotropicFiltering, Stage);
+			}
 			ProxyInterface->SetSamplerState(Stage, D3DSAMP_MINFILTER, D3DTEXF_ANISOTROPIC);
 			ProxyInterface->SetSamplerState(Stage, D3DSAMP_MAXANISOTROPY, (DWORD)nAnisotropicFiltering);
 		}
@@ -1014,6 +1051,58 @@ HRESULT m_IDirect3DDevice9Ex::SetDepthStencilSurface(THIS_ IDirect3DSurface9* pN
 		pNewZStencil = static_cast<m_IDirect3DSurface9 *>(pNewZStencil)->GetProxyInterface();
 	}
 
+	// Bind/unbind telemetry consumed by PresentDiagTick (dllmain.cpp). Validates the planned
+	// "AO at depth-unbind" pass: it is only viable if the scene depth is unbound exactly once
+	// per frame while the back buffer is the active render target.
+	if (pNewZStencil)
+	{
+		g_dsBindCount++;
+		// Measure which RT the game renders the scene into while our cached depth is bound.
+		// The depth surface can be larger than the back buffer (legal in D3D9 — content then
+		// only fills the RT-sized region), so the SSAO shader needs RT/depth as a UV scale.
+		// Track the largest RT observed; the scene pass is the biggest consumer.
+		if (g_sceneDepthSurf && pNewZStencil == g_sceneDepthSurf)
+		{
+			IDirect3DSurface9* rt = nullptr;
+			if (SUCCEEDED(ProxyInterface->GetRenderTarget(0, &rt)) && rt)
+			{
+				D3DSURFACE_DESC d;
+				if (SUCCEEDED(rt->GetDesc(&d)) && (d.Width > g_sceneDepthRTW || d.Height > g_sceneDepthRTH))
+				{
+					g_sceneDepthRTW = d.Width;
+					g_sceneDepthRTH = d.Height;
+					WrapperLog("SceneDepth: bound with RT %ux%u (depth %ux%u) -> SSAO uv scale %.3fx%.3f\n",
+						d.Width, d.Height, g_sceneDepthW, g_sceneDepthH,
+						(double)d.Width / g_sceneDepthW, (double)d.Height / g_sceneDepthH);
+				}
+				rt->Release();
+			}
+		}
+	}
+	else
+	{
+		g_dsNullUnbindCount++;
+		if (g_curDepthReal && g_sceneDepthSurf && g_curDepthReal == g_sceneDepthSurf)
+		{
+			IDirect3DSurface9* rt = nullptr;
+			IDirect3DSurface9* bb = nullptr;
+			ProxyInterface->GetRenderTarget(0, &rt);
+			ProxyInterface->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
+			if (rt && bb && rt == bb)
+			{
+				g_dsSceneUnbindOnBB++;
+				// Option B: 3D scene complete, UI not drawn yet — apply SSAO to the back buffer now,
+				// before the game composites its UI on top. Runs once per frame; the Present pass
+				// suppresses its own SSAO when this fired (g_aoDoneThisFrame).
+				if (!g_aoDoneThisFrame)
+					DeviceSSAOAtUnbind(ProxyInterface);
+			}
+			if (rt) rt->Release();
+			if (bb) bb->Release();
+		}
+	}
+	g_curDepthReal = pNewZStencil;
+
 	return ProxyInterface->SetDepthStencilSurface(pNewZStencil);
 }
 
@@ -1219,6 +1308,8 @@ HRESULT m_IDirect3DDevice9Ex::CheckDeviceState(THIS_ HWND hDestinationWindow)
 
 HRESULT m_IDirect3DDevice9Ex::CreateRenderTargetEx(THIS_ UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Lockable, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle, DWORD Usage)
 {
+	LogSurfaceCensus("RTEx", Width, Height, (UINT)Format, Usage, D3DPOOL_DEFAULT, (UINT)MultiSample);
+
 	HRESULT hr = ProxyInterface->CreateRenderTargetEx(Width, Height, Format, MultiSample, MultisampleQuality, Lockable, ppSurface, pSharedHandle, Usage);
 
 	if (SUCCEEDED(hr) && ppSurface)
@@ -1243,7 +1334,12 @@ HRESULT m_IDirect3DDevice9Ex::CreateOffscreenPlainSurfaceEx(THIS_ UINT Width, UI
 
 HRESULT m_IDirect3DDevice9Ex::CreateDepthStencilSurfaceEx(THIS_ UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Discard, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle, DWORD Usage)
 {
-	if (bSSAO && g_intzSupported && ppSurface && MultiSample == D3DMULTISAMPLE_NONE && !pSharedHandle)
+	LogSurfaceCensus("DSEx", Width, Height, (UINT)Format, Usage, D3DPOOL_DEFAULT, (UINT)MultiSample);
+
+	// Scene-depth only — see CreateDepthStencilSurface for why small (reflection/shadow) depths
+	// must keep the game's native format.
+	bool sceneSizedDepth = ((int)Width >= nBackBufferWidth && (int)Height >= nBackBufferHeight);
+	if (bSSAO && g_intzSupported && sceneSizedDepth && ppSurface && MultiSample == D3DMULTISAMPLE_NONE && !pSharedHandle)
 	{
 		IDirect3DTexture9* intzTex = nullptr;
 		HRESULT hrTex = ProxyInterface->CreateTexture(Width, Height, 1, D3DUSAGE_DEPTHSTENCIL,

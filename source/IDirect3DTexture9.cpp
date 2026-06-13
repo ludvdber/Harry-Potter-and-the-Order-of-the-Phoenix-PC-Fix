@@ -18,6 +18,7 @@
 #include "d3dx9.h"
 
 extern void WrapperLog(const char* fmt, ...);
+extern int g_mipRegenCount;
 
 HRESULT m_IDirect3DTexture9::QueryInterface(THIS_ REFIID riid, void** ppvObj)
 {
@@ -166,6 +167,11 @@ HRESULT m_IDirect3DTexture9::UnlockRect(THIS_ UINT Level)
 			ProxyInterface->GetLevelDesc(0, &desc);
 			WrapperLog("D3DXFilterTexture FAILED %dx%d fmt=%d hr=0x%08X\n",
 				desc.Width, desc.Height, (int)desc.Format, (unsigned)hrFilter);
+		}
+		else
+		{
+			// Cumulative total reported in the periodic "Diag" log lines (dllmain.cpp).
+			g_mipRegenCount++;
 		}
 		m_needsMipRegen = false;
 	}

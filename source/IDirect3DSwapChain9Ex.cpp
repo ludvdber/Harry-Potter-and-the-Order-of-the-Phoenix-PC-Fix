@@ -33,14 +33,21 @@ extern bool  g_intzSupported;
 extern IDirect3DTexture9* g_sceneDepthTex;
 extern UINT  g_sceneDepthW;
 extern UINT  g_sceneDepthH;
+extern IDirect3DSurface9* g_sceneDepthSurf;
+extern IDirect3DSurface9* g_curDepthReal;
+extern UINT g_sceneDepthRTW;
+extern UINT g_sceneDepthRTH;
+extern bool g_aoDoneThisFrame; // set by the depth-unbind AO pass; tells the Present pass to skip SSAO
 extern void WrapperLog(const char* fmt, ...);
 
 // FXAA + adaptive sharpening + color grading + screen-space AO pixel shader.
 // Runs on the final frame, single combined pass for performance.
-// Constants: c0 = (rcpFrameX, rcpFrameY, _, _)
+// Constants: c0 = (rcpFrameX, rcpFrameY, frameW, frameH)
 //            c1 = (lift, gamma, gain, vibrance)
 //            c2 = (vignetteStrength, _, _, _)
 //            c3 = (ssaoStrength, ssaoRadiusPx, ssaoMinDelta, ssaoMaxDelta)
+//            c4 = (depthUVScaleX, depthUVScaleY, _, _) — maps screen UVs onto the depth
+//                 texture when it is larger than the back buffer (post-Reset window-sized depth)
 // Samplers: s0 = scene color, s1 = depth (INTZ when available)
 static const char* g_fxaaPS = R"(
 sampler2D scene    : register(s0);
@@ -49,6 +56,7 @@ float4 rcpFrame    : register(c0);
 float4 grade1      : register(c1);
 float4 grade2      : register(c2);
 float4 ssaoP       : register(c3);
+float4 dScale      : register(c4);
 float luma(float3 c){return dot(c,float3(0.299,0.587,0.114));}
 float ssaoFactor(float2 uv, float lumaRange){
     if (ssaoP.x < 0.001) return 1.0;
@@ -57,7 +65,7 @@ float ssaoFactor(float2 uv, float lumaRange){
     // background object silhouettes through the UI as gray outlines. Real 3D surfaces have
     // texture / lighting variance at 1px radius; flat UI overlays don't.
     if (lumaRange < 0.01) return 1.0;
-    float zC = tex2D(depthTex, uv).r;
+    float zC = tex2D(depthTex, uv * dScale.xy).r;
     if (zC > 0.9995) return 1.0;
     // Perspective Z is non-linear: a 50 cm contact distance produces a delta of ~0.003 near
     // the camera and ~0.00002 at far distance. Scaling thresholds by (1 - zC) approximates the
@@ -66,19 +74,32 @@ float ssaoFactor(float2 uv, float lumaRange){
     float depthScale = max(1.0 - zC, 0.001);
     float minD = ssaoP.z * depthScale;
     float maxD = ssaoP.w * depthScale;
-    static const float2 off[8] = {
-        float2( 1, 0), float2(-1, 0), float2( 0, 1), float2( 0,-1),
-        float2( 0.7071, 0.7071), float2(-0.7071, 0.7071),
-        float2( 0.7071,-0.7071), float2(-0.7071,-0.7071)
+    // 12-tap golden-angle spiral over the whole sampling disk (radii sqrt-spaced for even
+    // area coverage, outermost tap = ssaoRadiusPx), rotated per pixel by interleaved
+    // gradient noise. A static kernel repeats the same pattern on every pixel, which shows
+    // up as banding/ringing around objects; per-pixel rotation converts that error into
+    // high-frequency noise the eye ignores (and the FXAA pass in this same shader smooths).
+    // Disk coverage (vs the old single-radius ring) gives the AO volume in corners instead
+    // of a thin contact line.
+    static const float2 off[12] = {
+        float2( 0.2887,  0.0000), float2(-0.3010,  0.2758), float2( 0.0437, -0.4981),
+        float2( 0.3514,  0.4582), float2(-0.6356, -0.1124), float2( 0.5967, -0.3795),
+        float2(-0.1986,  0.7375), float2(-0.3750, -0.7253), float2( 0.8134,  0.2974),
+        float2(-0.8438,  0.3485), float2( 0.4045, -0.8677), float2( 0.2997,  0.9540)
     };
+    float2 px = uv * rcpFrame.zw;
+    float ang = 6.2831853 * frac(52.9829189 * frac(dot(px, float2(0.06711056, 0.00583715))));
+    float sn, cs;
+    sincos(ang, sn, cs);
     float occ = 0.0;
-    for (int i=0; i<8; i++) {
-        float2 sUV = uv + off[i] * rcpFrame.xy * ssaoP.y;
+    for (int i=0; i<12; i++) {
+        float2 r = float2(off[i].x*cs - off[i].y*sn, off[i].x*sn + off[i].y*cs);
+        float2 sUV = (uv + r * rcpFrame.xy * ssaoP.y) * dScale.xy;
         float zS = tex2D(depthTex, sUV).r;
         float d = zC - zS;
         if (d > minD && d < maxD) occ += 1.0;
     }
-    return saturate(1.0 - (occ / 8.0) * ssaoP.x);
+    return saturate(1.0 - (occ / 12.0) * ssaoP.x);
 }
 float3 grade(float3 col,float2 uv){
     col = saturate(col * grade1.z + grade1.x);
@@ -121,19 +142,73 @@ float4 main(float2 uv:TEXCOORD0):COLOR0{
 }
 )";
 
+// Standalone SSAO shader for the "AO at depth-unbind" pass (option B). Identical occlusion math
+// to the combined shader's ssaoFactor, but it runs on the pure 3D scene the instant the game
+// unbinds scene depth (before any UI is drawn), so it needs NO luma-variance UI-bleed guard —
+// there is no UI in the buffer yet. Output is sceneColor * ao; FXAA + grading still run at Present.
+// Constants/samplers match the combined shader: s0 scene, s1 depth, c0 rcp+dims, c3 ssao, c4 uvscale.
+static const char* g_aoPS = R"(
+sampler2D scene    : register(s0);
+sampler2D depthTex : register(s1);
+float4 rcpFrame    : register(c0);
+float4 ssaoP       : register(c3);
+float4 dScale      : register(c4);
+float4 main(float2 uv:TEXCOORD0):COLOR0{
+    float3 col = tex2D(scene, uv).rgb;
+    if (ssaoP.x < 0.001) return float4(col, 1);
+    float zC = tex2D(depthTex, uv * dScale.xy).r;
+    if (zC > 0.9995) return float4(col, 1);
+    float depthScale = max(1.0 - zC, 0.001);
+    float minD = ssaoP.z * depthScale;
+    float maxD = ssaoP.w * depthScale;
+    float2 off[12] = {
+        float2( 0.2887,  0.0000), float2(-0.3010,  0.2758), float2( 0.0437, -0.4981),
+        float2( 0.3514,  0.4582), float2(-0.6356, -0.1124), float2( 0.5967, -0.3795),
+        float2(-0.1986,  0.7375), float2(-0.3750, -0.7253), float2( 0.8134,  0.2974),
+        float2(-0.8438,  0.3485), float2( 0.4045, -0.8677), float2( 0.2997,  0.9540)
+    };
+    float2 px = uv * rcpFrame.zw;
+    float ang = 6.2831853 * frac(52.9829189 * frac(dot(px, float2(0.06711056, 0.00583715))));
+    float sn, cs;
+    sincos(ang, sn, cs);
+    float occ = 0.0;
+    for (int i=0; i<12; i++) {
+        float2 r = float2(off[i].x*cs - off[i].y*sn, off[i].x*sn + off[i].y*cs);
+        float2 sUV = (uv + r * rcpFrame.xy * ssaoP.y) * dScale.xy;
+        float zS = tex2D(depthTex, sUV).r;
+        float d = zC - zS;
+        if (d > minD && d < maxD) occ += 1.0;
+    }
+    float ao = saturate(1.0 - (occ / 12.0) * ssaoP.x);
+    return float4(col * ao, 1);
+}
+)";
+
 static IDirect3DTexture9*    s_fxaaTex  = nullptr;
 static IDirect3DSurface9*    s_fxaaSurf = nullptr;
 static IDirect3DPixelShader9* s_fxaaPS  = nullptr;
+static IDirect3DPixelShader9* s_aoPS    = nullptr;
 static UINT s_fxaaW = 0, s_fxaaH = 0;
+static bool s_fxaaInitFailed = false;
 
 void FreeFXAA()
 {
+    if (s_fxaaPS)
+        WrapperLog("FXAA: resources released (device Reset)\n");
     if (s_fxaaSurf) { s_fxaaSurf->Release(); s_fxaaSurf = nullptr; }
     if (s_fxaaTex)  { s_fxaaTex->Release();  s_fxaaTex  = nullptr; }
     if (s_fxaaPS)   { s_fxaaPS->Release();   s_fxaaPS   = nullptr; }
+    if (s_aoPS)     { s_aoPS->Release();     s_aoPS     = nullptr; }
     s_fxaaW = s_fxaaH = 0;
     if (g_sceneDepthTex) { g_sceneDepthTex->Release(); g_sceneDepthTex = nullptr; }
     g_sceneDepthW = g_sceneDepthH = 0;
+    // Compare-only diagnostic pointers — would dangle once the texture above is released.
+    g_sceneDepthSurf = nullptr;
+    g_curDepthReal = nullptr;
+    g_sceneDepthRTW = g_sceneDepthRTH = 0;
+    // A failure can be transient (device mid-Reset); each Reset earns a fresh init attempt,
+    // otherwise FXAA/grading/SSAO would stay disabled for the rest of the session.
+    s_fxaaInitFailed = false;
 }
 
 static bool InitFXAA(IDirect3DDevice9* dev, UINT W, UINT H, D3DFORMAT fmt)
@@ -160,9 +235,107 @@ static bool InitFXAA(IDirect3DDevice9* dev, UINT W, UINT H, D3DFORMAT fmt)
     dev->CreatePixelShader((DWORD*)pCode->GetBufferPointer(), &s_fxaaPS);
     pCode->Release();
 
+    // AO-only shader for the depth-unbind pass (option B). Non-fatal if it fails: the Present
+    // pass keeps its own SSAO as a fallback (gated on g_aoDoneThisFrame staying false).
+    ID3DXBuffer* pAOCode = nullptr;
+    ID3DXBuffer* pAOErr  = nullptr;
+    if (SUCCEEDED(D3DXCompileShader(g_aoPS, (UINT)strlen(g_aoPS), nullptr, nullptr,
+                                     "main", "ps_3_0", 0, &pAOCode, &pAOErr, nullptr)))
+    {
+        dev->CreatePixelShader((DWORD*)pAOCode->GetBufferPointer(), &s_aoPS);
+        pAOCode->Release();
+    }
+    else
+    {
+        WrapperLog("AO-unbind: shader compile failed: %s (falling back to SSAO-at-Present)\n",
+            pAOErr ? (char*)pAOErr->GetBufferPointer() : "?");
+    }
+    if (pAOErr) pAOErr->Release();
+
     s_fxaaW = W; s_fxaaH = H;
-    WrapperLog("FXAA init: %dx%d fmt=%d\n", W, H, (int)fmt);
+    WrapperLog("FXAA init: %dx%d fmt=%d (SSAO kernel: 12-tap spiral, per-pixel rotation)\n", W, H, (int)fmt);
     return true;
+}
+
+// Option B: apply SSAO the instant the game unbinds scene depth (3D done, UI not yet drawn).
+// Darkens the back buffer in place; the game then composites UI on top untouched, and the
+// Present pass runs FXAA + grading on the result (its own SSAO suppressed via g_aoDoneThisFrame).
+// Reuses s_fxaaTex/s_fxaaSurf as the scene-copy scratch (the two passes never overlap in time).
+void DeviceSSAOAtUnbind(IDirect3DDevice9* dev)
+{
+    if (!bFXAA || !bSSAO || !g_intzSupported || !g_sceneDepthTex) return;
+    if (!s_aoPS || !s_fxaaTex || !s_fxaaSurf) return; // resources not ready yet (first frame)
+
+    IDirect3DSurface9* pBB = nullptr;
+    if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &pBB)) || !pBB) return;
+    D3DSURFACE_DESC desc;
+    pBB->GetDesc(&desc);
+    if (desc.Width != s_fxaaW || desc.Height != s_fxaaH) { pBB->Release(); return; }
+
+    if (FAILED(dev->StretchRect(pBB, nullptr, s_fxaaSurf, nullptr, D3DTEXF_NONE))) { pBB->Release(); return; }
+
+    IDirect3DStateBlock9* pSB = nullptr;
+    if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &pSB)) || !pSB) { pBB->Release(); return; }
+
+    // Render target is already the back buffer (verified by the caller); leave depth-stencil bound
+    // (Z disabled below makes it irrelevant) so we don't disturb the game's about-to-unbind state.
+    dev->SetRenderTarget(0, pBB);
+    dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    D3DVIEWPORT9 vp = { 0, 0, s_fxaaW, s_fxaaH, 0.0f, 1.0f };
+    dev->SetViewport(&vp);
+
+    dev->SetVertexShader(nullptr);
+    dev->SetPixelShader(s_aoPS);
+    dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    dev->SetTexture(0, s_fxaaTex);
+    dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSU,  D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSV,  D3DTADDRESS_CLAMP);
+    dev->SetTexture(1, g_sceneDepthTex);
+    dev->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    dev->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    dev->SetSamplerState(1, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    dev->SetSamplerState(1, D3DSAMP_ADDRESSU,  D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(1, D3DSAMP_ADDRESSV,  D3DTADDRESS_CLAMP);
+
+    float rcpF[4] = { 1.0f / s_fxaaW, 1.0f / s_fxaaH, (float)s_fxaaW, (float)s_fxaaH };
+    dev->SetPixelShaderConstantF(0, rcpF, 1);
+    float ssaoP[4] = { fSSAOStrength, fSSAORadius, fSSAOMinDelta, fSSAOMaxDelta };
+    dev->SetPixelShaderConstantF(3, ssaoP, 1);
+    float dsc[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
+    if (g_sceneDepthW && g_sceneDepthH && g_sceneDepthRTW && g_sceneDepthRTH)
+    {
+        float sx = (float)g_sceneDepthRTW / (float)g_sceneDepthW;
+        float sy = (float)g_sceneDepthRTH / (float)g_sceneDepthH;
+        if (sx <= 1.0f && sy <= 1.0f) { dsc[0] = sx; dsc[1] = sy; }
+    }
+    dev->SetPixelShaderConstantF(4, dsc, 1);
+
+    struct V { float x, y, z, w, u, v; };
+    float W = (float)s_fxaaW, H = (float)s_fxaaH;
+    V q[4] = {
+        { -0.5f,    -0.5f,    0, 1,  0, 0 },
+        { W-0.5f,   -0.5f,    0, 1,  1, 0 },
+        { -0.5f,    H-0.5f,   0, 1,  0, 1 },
+        { W-0.5f,   H-0.5f,   0, 1,  1, 1 },
+    };
+    dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
+
+    pSB->Apply();
+    pSB->Release();
+    pBB->Release();
+
+    g_aoDoneThisFrame = true;
+    static bool s_logged = false;
+    if (!s_logged) { s_logged = true; WrapperLog("SSAO: running at scene depth-unbind, pre-UI (option B)\n"); }
 }
 
 static void ApplyFXAA(IDirect3DDevice9* dev, IDirect3DSurface9* pBB)
@@ -171,9 +344,11 @@ static void ApplyFXAA(IDirect3DDevice9* dev, IDirect3DSurface9* pBB)
     if (FAILED(dev->StretchRect(pBB, nullptr, s_fxaaSurf, nullptr, D3DTEXF_NONE)))
         return;
 
-    // Save full device state, apply FXAA pass, restore
+    // Save full device state, apply FXAA pass, restore. Without a state block we can't
+    // restore the game's state afterwards, so skip the pass entirely rather than corrupt it.
     IDirect3DStateBlock9* pSB = nullptr;
-    dev->CreateStateBlock(D3DSBT_ALL, &pSB);
+    if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &pSB)) || !pSB)
+        return;
 
     dev->SetRenderTarget(0, pBB);
     dev->SetDepthStencilSurface(nullptr);
@@ -196,7 +371,7 @@ static void ApplyFXAA(IDirect3DDevice9* dev, IDirect3DSurface9* pBB)
     dev->SetSamplerState(0, D3DSAMP_MIPFILTER,  D3DTEXF_NONE);
     dev->SetSamplerState(0, D3DSAMP_ADDRESSU,   D3DTADDRESS_CLAMP);
     dev->SetSamplerState(0, D3DSAMP_ADDRESSV,   D3DTADDRESS_CLAMP);
-    float rcpF[4] = { 1.0f / s_fxaaW, 1.0f / s_fxaaH, 0, 0 };
+    float rcpF[4] = { 1.0f / s_fxaaW, 1.0f / s_fxaaH, (float)s_fxaaW, (float)s_fxaaH };
     dev->SetPixelShaderConstantF(0, rcpF, 1);
     // c1 = (lift, gamma, gain, vibrance), c2 = (vignette, _, _, _). Neutral when ColorGrading=0.
     float grade1[4] = { 0.0f, 1.0f, 1.0f, 0.0f };
@@ -215,8 +390,11 @@ static void ApplyFXAA(IDirect3DDevice9* dev, IDirect3DSurface9* pBB)
     // SSAO: use the cached scene-depth INTZ texture (populated at CreateDepthStencilSurface time).
     // We do NOT use GetDepthStencilSurface here because the game often unbinds depth before Present
     // (UI rendering); the cached texture still holds the last-rendered scene depth contents.
+    // Skip SSAO here when the depth-unbind pass (option B) already darkened this frame's scene.
+    // If that pass didn't run (g_aoDoneThisFrame still false — e.g. a scene with no clean
+    // scene-depth unbind), fall back to doing SSAO in this combined pass, UI-bleed guard included.
     bool ssaoActive = false;
-    if (bSSAO && g_intzSupported && g_sceneDepthTex)
+    if (bSSAO && g_intzSupported && g_sceneDepthTex && !g_aoDoneThisFrame)
     {
         ssaoActive = true;
     }
@@ -242,6 +420,21 @@ static void ApplyFXAA(IDirect3DDevice9* dev, IDirect3DSurface9* pBB)
         }
     }
     dev->SetPixelShaderConstantF(3, ssaoP, 1);
+    // c4: screen-UV -> depth-UV scale. Identity until the game has bound the cached depth at
+    // least once (g_sceneDepthRTW measured in SetDepthStencilSurface); identity also covers
+    // the common case where depth and back buffer have the same size.
+    float dsc[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
+    if (ssaoActive && g_sceneDepthW && g_sceneDepthH && g_sceneDepthRTW && g_sceneDepthRTH)
+    {
+        float sx = (float)g_sceneDepthRTW / (float)g_sceneDepthW;
+        float sy = (float)g_sceneDepthRTH / (float)g_sceneDepthH;
+        if (sx <= 1.0f && sy <= 1.0f)
+        {
+            dsc[0] = sx;
+            dsc[1] = sy;
+        }
+    }
+    dev->SetPixelShaderConstantF(4, dsc, 1);
 
     // Full-screen quad with D3D9 half-pixel offset
     struct V { float x, y, z, w, u, v; };
@@ -261,7 +454,6 @@ static void ApplyFXAA(IDirect3DDevice9* dev, IDirect3DSurface9* pBB)
 void DeviceFXAAPresent(IDirect3DDevice9* dev)
 {
     if (!bFXAA) return;
-    static bool s_fxaaInitFailed = false;
     if (s_fxaaInitFailed) return;
     IDirect3DSurface9* pBB = nullptr;
     if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &pBB)))
