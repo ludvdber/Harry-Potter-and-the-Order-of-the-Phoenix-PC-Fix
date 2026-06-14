@@ -90,7 +90,7 @@ int nResolutionHeight;
 int nBackBufferWidth = 0;
 int nBackBufferHeight = 0;
 bool bFXAA;
-float fSharpness = 0.25f;
+float fSharpness = 0.40f;
 int nSSAAFactor = 1;
 bool bColorGrading;
 float fVibrance;
@@ -98,11 +98,21 @@ float fVignette;
 float fLift;
 float fGamma;
 float fGain;
+float fTemperature = 0.0f;
+float fTint = 0.0f;
+float fContrast = 0.0f;
+float fSplitTone = 0.0f;
 bool  bSSAO;
 float fSSAOStrength;
 float fSSAORadius;
 float fSSAOMinDelta;
 float fSSAOMaxDelta;
+bool  bBloom = false;
+float fBloomStrength = 0.35f;
+float fBloomThreshold = 0.75f;
+bool  bGodRays = false;
+float fGodRaysStrength = 0.45f;
+float fGodRaysDecay = 0.96f;
 int nScreenshotKey;
 bool  g_intzChecked = false;
 bool  g_intzSupported = false;
@@ -1576,7 +1586,19 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 				GetPrivateProfileStringA("GRAPHICS", "Lift",      "0.00", szF, sizeof(szF), path); fLift     = (float)atof(szF);
 				GetPrivateProfileStringA("GRAPHICS", "Gamma",     "1.00", szF, sizeof(szF), path); fGamma    = (float)atof(szF);
 				GetPrivateProfileStringA("GRAPHICS", "Gain",      "1.05", szF, sizeof(szF), path); fGain     = (float)atof(szF);
-					GetPrivateProfileStringA("GRAPHICS", "Sharpness", "0.25", szF, sizeof(szF), path); fSharpness = (float)atof(szF);
+					GetPrivateProfileStringA("GRAPHICS", "Temperature", "0.00", szF, sizeof(szF), path); fTemperature = (float)atof(szF);
+					GetPrivateProfileStringA("GRAPHICS", "Tint",        "0.00", szF, sizeof(szF), path); fTint        = (float)atof(szF);
+					GetPrivateProfileStringA("GRAPHICS", "Contrast",    "0.00", szF, sizeof(szF), path); fContrast    = (float)atof(szF);
+					GetPrivateProfileStringA("GRAPHICS", "SplitTone",   "0.00", szF, sizeof(szF), path); fSplitTone   = (float)atof(szF);
+					if (fTemperature < -1.0f) fTemperature = -1.0f;
+					if (fTemperature >  1.0f) fTemperature =  1.0f;
+					if (fTint < -1.0f) fTint = -1.0f;
+					if (fTint >  1.0f) fTint =  1.0f;
+					if (fContrast < 0.0f) fContrast = 0.0f;
+					if (fContrast > 1.0f) fContrast = 1.0f;
+					if (fSplitTone < 0.0f) fSplitTone = 0.0f;
+					if (fSplitTone > 1.0f) fSplitTone = 1.0f;
+					GetPrivateProfileStringA("GRAPHICS", "Sharpness", "0.40", szF, sizeof(szF), path); fSharpness = (float)atof(szF);
 					if (fSharpness < 0.0f) fSharpness = 0.0f;
 					if (fSharpness > 1.0f) fSharpness = 1.0f;
 			}
@@ -1587,6 +1609,16 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 				GetPrivateProfileStringA("GRAPHICS", "SSAORadius",   "6.0",  szF, sizeof(szF), path); fSSAORadius   = (float)atof(szF);
 				GetPrivateProfileStringA("GRAPHICS", "SSAOMinDelta", "0.0005", szF, sizeof(szF), path); fSSAOMinDelta = (float)atof(szF);
 				GetPrivateProfileStringA("GRAPHICS", "SSAOMaxDelta", "0.05",   szF, sizeof(szF), path); fSSAOMaxDelta = (float)atof(szF);
+					bBloom = GetPrivateProfileInt("GRAPHICS", "Bloom", 0, path) != 0;
+					bGodRays = GetPrivateProfileInt("GRAPHICS", "GodRays", 0, path) != 0;
+					GetPrivateProfileStringA("GRAPHICS", "BloomStrength",   "0.35", szF, sizeof(szF), path); fBloomStrength   = (float)atof(szF);
+					GetPrivateProfileStringA("GRAPHICS", "BloomThreshold",  "0.75", szF, sizeof(szF), path); fBloomThreshold  = (float)atof(szF);
+					GetPrivateProfileStringA("GRAPHICS", "GodRaysStrength", "0.45", szF, sizeof(szF), path); fGodRaysStrength = (float)atof(szF);
+					GetPrivateProfileStringA("GRAPHICS", "GodRaysDecay",    "0.96", szF, sizeof(szF), path); fGodRaysDecay    = (float)atof(szF);
+					if (fBloomThreshold < 0.0f) fBloomThreshold = 0.0f;
+					if (fBloomThreshold > 1.0f) fBloomThreshold = 1.0f;
+					if (fGodRaysDecay < 0.80f) fGodRaysDecay = 0.80f;
+					if (fGodRaysDecay > 0.999f) fGodRaysDecay = 0.999f;
 			}
 			nResolutionWidth = GetPrivateProfileInt("RESOLUTION", "Width", 0, path);
 			nResolutionHeight = GetPrivateProfileInt("RESOLUTION", "Height", 0, path);
@@ -1598,8 +1630,11 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 				nResolutionWidth, nResolutionHeight, nAnisotropicFiltering, fTextureLODBias, nAntialiasing, (int)bFXAA, fSharpness, (int)bVSync, nSSAAFactor, nShadowMapScale);
 			WrapperLog("  ColorGrading=%d  Vibrance=%.2f  Vignette=%.2f  Lift=%.2f  Gamma=%.2f  Gain=%.2f\n",
 				(int)bColorGrading, fVibrance, fVignette, fLift, fGamma, fGain);
+				WrapperLog("  Temperature=%.2f  Tint=%.2f  Contrast=%.2f  SplitTone=%.2f\n", fTemperature, fTint, fContrast, fSplitTone);
 			WrapperLog("  SSAO=%d  Strength=%.2f  Radius=%.1f  MinDelta=%.4f  MaxDelta=%.4f\n",
 				(int)bSSAO, fSSAOStrength, fSSAORadius, fSSAOMinDelta, fSSAOMaxDelta);
+				WrapperLog("  Bloom=%d  BloomStrength=%.2f  BloomThreshold=%.2f  GodRays=%d  GodRaysStrength=%.2f  GodRaysDecay=%.3f\n",
+					(int)bBloom, fBloomStrength, fBloomThreshold, (int)bGodRays, fGodRaysStrength, fGodRaysDecay);
 
 			if (fFPSLimit > 0.0f)
 			{
