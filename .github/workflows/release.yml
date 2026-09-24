@@ -18,10 +18,6 @@ on:
         description: "Créer la release (brouillon). Décoché : simple build d'essai, rien n'est publié."
         type: boolean
         default: false
-  # TEMPORARY, removed in the next commit: the Claude GitHub app cannot
-  # dispatch workflows, so this lets the trial build run on the branch.
-  push:
-    branches: [claude/dazzling-cannon-nl0omq]
 
 permissions:
   contents: read
