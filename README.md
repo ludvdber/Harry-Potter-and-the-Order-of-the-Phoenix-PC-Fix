@@ -6,7 +6,7 @@ An enhanced **Direct3D 9 wrapper** for *Harry Potter and the Order of the Phoeni
 
 All visual effects run as post-process passes (no texture replacement) and every value lives in `d3d9.ini`, read once at launch.
 
-This project began as a fork of Chip-Biscuit's HP5 PC Fix, itself built on Elisha Riedlinger's and ThirteenAG's generic D3D9 proxy wrapper. The original repository is no longer online, and the code here has grown far past it, so it is now maintained as an **independent project**. Everything described under "What this project adds" is new here and never existed in the original releases. License: [Unlicense](LICENSE) (public domain).
+This project began as a fork of Chip-Biscuit's HP5 PC Fix, itself built on Elisha Riedlinger's and ThirteenAG's generic D3D9 proxy wrapper. The original repository is no longer online, and the code here has grown far past it, so it is now maintained as an **independent project**. Everything described under "What this project adds" is new here and never existed in the original releases. License: © Accio Launcher, [PolyForm Strict 1.0.0 with an additional permission](license) — you may fork, change and build it for yourself, but you may not redistribute it in any form. Third-party parts keep their own licenses ([notices](THIRD_PARTY_NOTICES.md)).
 
 The same wrapper is being adapted to *Half-Blood Prince* (HP6) and *Goblet of Fire* (HP4) in sister repositories.
 
