@@ -113,7 +113,7 @@
     <ClCompile>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <WarningLevel>Level3</WarningLevel>
-      <PreprocessorDefinitions>rsc_CompanyName="ThirteenAG";rsc_LegalCopyright="MIT License";rsc_FileVersion="1.0.0.0";rsc_ProductVersion="1.0.0.0";rsc_InternalName="d3d9-wrapper";rsc_ProductName="d3d9-wrapper";rsc_OriginalFilename="d3d9.dll";rsc_FileDescription="https://thirteenag.github.io/wfp";rsc_UpdateUrl="https://github.com/ThirteenAG/d3d9-wrapper";NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>rsc_CompanyName="Accio Launcher";rsc_LegalCopyright="PolyForm Strict 1.0.0";rsc_FileVersion="1.0.0.0";rsc_ProductVersion="1.0.0.0";rsc_InternalName="d3d9-wrapper";rsc_ProductName="Accio Launcher - HP5 PC Fix";rsc_OriginalFilename="d3d9.dll";rsc_FileDescription="Harry Potter and the Order of the Phoenix - PC fix";rsc_UpdateUrl="https://github.com/ludvdber/Harry-Potter-and-the-Order-of-the-Phoenix-PC-Fix";NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\source\dxsdk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <Optimization>Full</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
@@ -124,7 +124,7 @@
       <AdditionalOptions>-std:c++latest %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <ResourceCompile>
-      <PreprocessorDefinitions>rsc_CompanyName=\"ThirteenAG\";rsc_LegalCopyright=\"MIT License\";rsc_FileVersion=\"1.0.0.0\";rsc_ProductVersion=\"1.0.0.0\";rsc_InternalName=\"d3d9-wrapper\";rsc_ProductName=\"d3d9-wrapper\";rsc_OriginalFilename=\"d3d9.dll\";rsc_FileDescription=\"https://thirteenag.github.io/wfp\";rsc_UpdateUrl=\"https://github.com/ThirteenAG/d3d9-wrapper\";NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>rsc_CompanyName=\"Accio Launcher\";rsc_LegalCopyright=\"PolyForm Strict 1.0.0\";rsc_FileVersion=\"1.0.0.0\";rsc_ProductVersion=\"1.0.0.0\";rsc_InternalName=\"d3d9-wrapper\";rsc_ProductName=\"Accio Launcher - HP5 PC Fix\";rsc_OriginalFilename=\"d3d9.dll\";rsc_FileDescription=\"Harry Potter and the Order of the Phoenix - PC fix\";rsc_UpdateUrl=\"https://github.com/ludvdber/Harry-Potter-and-the-Order-of-the-Phoenix-PC-Fix\";NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\source\dxsdk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
@@ -143,7 +143,7 @@
     <ClCompile>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <WarningLevel>Level3</WarningLevel>
-      <PreprocessorDefinitions>rsc_CompanyName="ThirteenAG";rsc_LegalCopyright="MIT License";rsc_FileVersion="1.0.0.0";rsc_ProductVersion="1.0.0.0";rsc_InternalName="d3d9-wrapper";rsc_ProductName="d3d9-wrapper";rsc_OriginalFilename="d3d9.dll";rsc_FileDescription="https://thirteenag.github.io/wfp";rsc_UpdateUrl="https://github.com/ThirteenAG/d3d9-wrapper";NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>rsc_CompanyName="Accio Launcher";rsc_LegalCopyright="PolyForm Strict 1.0.0";rsc_FileVersion="1.0.0.0";rsc_ProductVersion="1.0.0.0";rsc_InternalName="d3d9-wrapper";rsc_ProductName="Accio Launcher - HP5 PC Fix";rsc_OriginalFilename="d3d9.dll";rsc_FileDescription="Harry Potter and the Order of the Phoenix - PC fix";rsc_UpdateUrl="https://github.com/ludvdber/Harry-Potter-and-the-Order-of-the-Phoenix-PC-Fix";NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\source\dxsdk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <Optimization>Full</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
@@ -154,7 +154,7 @@
       <AdditionalOptions>-std:c++latest %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <ResourceCompile>
-      <PreprocessorDefinitions>rsc_CompanyName=\"ThirteenAG\";rsc_LegalCopyright=\"MIT License\";rsc_FileVersion=\"1.0.0.0\";rsc_ProductVersion=\"1.0.0.0\";rsc_InternalName=\"d3d9-wrapper\";rsc_ProductName=\"d3d9-wrapper\";rsc_OriginalFilename=\"d3d9.dll\";rsc_FileDescription=\"https://thirteenag.github.io/wfp\";rsc_UpdateUrl=\"https://github.com/ThirteenAG/d3d9-wrapper\";NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>rsc_CompanyName=\"Accio Launcher\";rsc_LegalCopyright=\"PolyForm Strict 1.0.0\";rsc_FileVersion=\"1.0.0.0\";rsc_ProductVersion=\"1.0.0.0\";rsc_InternalName=\"d3d9-wrapper\";rsc_ProductName=\"Accio Launcher - HP5 PC Fix\";rsc_OriginalFilename=\"d3d9.dll\";rsc_FileDescription=\"Harry Potter and the Order of the Phoenix - PC fix\";rsc_UpdateUrl=\"https://github.com/ludvdber/Harry-Potter-and-the-Order-of-the-Phoenix-PC-Fix\";NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\source\dxsdk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
@@ -173,7 +173,7 @@
     <ClCompile>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <WarningLevel>Level3</WarningLevel>
-      <PreprocessorDefinitions>rsc_CompanyName="ThirteenAG";rsc_LegalCopyright="MIT License";rsc_FileVersion="1.0.0.0";rsc_ProductVersion="1.0.0.0";rsc_InternalName="d3d9-wrapper";rsc_ProductName="d3d9-wrapper";rsc_OriginalFilename="d3d9.dll";rsc_FileDescription="https://thirteenag.github.io/wfp";rsc_UpdateUrl="https://github.com/ThirteenAG/d3d9-wrapper";DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>rsc_CompanyName="Accio Launcher";rsc_LegalCopyright="PolyForm Strict 1.0.0";rsc_FileVersion="1.0.0.0";rsc_ProductVersion="1.0.0.0";rsc_InternalName="d3d9-wrapper";rsc_ProductName="Accio Launcher - HP5 PC Fix";rsc_OriginalFilename="d3d9.dll";rsc_FileDescription="Harry Potter and the Order of the Phoenix - PC fix";rsc_UpdateUrl="https://github.com/ludvdber/Harry-Potter-and-the-Order-of-the-Phoenix-PC-Fix";DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\source\dxsdk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <DebugInformationFormat>EditAndContinue</DebugInformationFormat>
       <Optimization>Disabled</Optimization>
@@ -181,7 +181,7 @@
       <AdditionalOptions>-std:c++latest %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <ResourceCompile>
-      <PreprocessorDefinitions>rsc_CompanyName=\"ThirteenAG\";rsc_LegalCopyright=\"MIT License\";rsc_FileVersion=\"1.0.0.0\";rsc_ProductVersion=\"1.0.0.0\";rsc_InternalName=\"d3d9-wrapper\";rsc_ProductName=\"d3d9-wrapper\";rsc_OriginalFilename=\"d3d9.dll\";rsc_FileDescription=\"https://thirteenag.github.io/wfp\";rsc_UpdateUrl=\"https://github.com/ThirteenAG/d3d9-wrapper\";DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>rsc_CompanyName=\"Accio Launcher\";rsc_LegalCopyright=\"PolyForm Strict 1.0.0\";rsc_FileVersion=\"1.0.0.0\";rsc_ProductVersion=\"1.0.0.0\";rsc_InternalName=\"d3d9-wrapper\";rsc_ProductName=\"Accio Launcher - HP5 PC Fix\";rsc_OriginalFilename=\"d3d9.dll\";rsc_FileDescription=\"Harry Potter and the Order of the Phoenix - PC fix\";rsc_UpdateUrl=\"https://github.com/ludvdber/Harry-Potter-and-the-Order-of-the-Phoenix-PC-Fix\";DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\source\dxsdk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
@@ -199,7 +199,7 @@
     <ClCompile>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <WarningLevel>Level3</WarningLevel>
-      <PreprocessorDefinitions>rsc_CompanyName="ThirteenAG";rsc_LegalCopyright="MIT License";rsc_FileVersion="1.0.0.0";rsc_ProductVersion="1.0.0.0";rsc_InternalName="d3d9-wrapper";rsc_ProductName="d3d9-wrapper";rsc_OriginalFilename="d3d9.dll";rsc_FileDescription="https://thirteenag.github.io/wfp";rsc_UpdateUrl="https://github.com/ThirteenAG/d3d9-wrapper";DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>rsc_CompanyName="Accio Launcher";rsc_LegalCopyright="PolyForm Strict 1.0.0";rsc_FileVersion="1.0.0.0";rsc_ProductVersion="1.0.0.0";rsc_InternalName="d3d9-wrapper";rsc_ProductName="Accio Launcher - HP5 PC Fix";rsc_OriginalFilename="d3d9.dll";rsc_FileDescription="Harry Potter and the Order of the Phoenix - PC fix";rsc_UpdateUrl="https://github.com/ludvdber/Harry-Potter-and-the-Order-of-the-Phoenix-PC-Fix";DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\source\dxsdk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <DebugInformationFormat>EditAndContinue</DebugInformationFormat>
       <Optimization>Disabled</Optimization>
@@ -207,7 +207,7 @@
       <AdditionalOptions>-std:c++latest %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <ResourceCompile>
-      <PreprocessorDefinitions>rsc_CompanyName=\"ThirteenAG\";rsc_LegalCopyright=\"MIT License\";rsc_FileVersion=\"1.0.0.0\";rsc_ProductVersion=\"1.0.0.0\";rsc_InternalName=\"d3d9-wrapper\";rsc_ProductName=\"d3d9-wrapper\";rsc_OriginalFilename=\"d3d9.dll\";rsc_FileDescription=\"https://thirteenag.github.io/wfp\";rsc_UpdateUrl=\"https://github.com/ThirteenAG/d3d9-wrapper\";DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>rsc_CompanyName=\"Accio Launcher\";rsc_LegalCopyright=\"PolyForm Strict 1.0.0\";rsc_FileVersion=\"1.0.0.0\";rsc_ProductVersion=\"1.0.0.0\";rsc_InternalName=\"d3d9-wrapper\";rsc_ProductName=\"Accio Launcher - HP5 PC Fix\";rsc_OriginalFilename=\"d3d9.dll\";rsc_FileDescription=\"Harry Potter and the Order of the Phoenix - PC fix\";rsc_UpdateUrl=\"https://github.com/ludvdber/Harry-Potter-and-the-Order-of-the-Phoenix-PC-Fix\";DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\source\dxsdk;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
