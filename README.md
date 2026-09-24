@@ -6,11 +6,13 @@ An enhanced **Direct3D 9 wrapper** for *Harry Potter and the Order of the Phoeni
 
 All visual effects run as post-process passes (no texture replacement) and every value lives in `d3d9.ini`, read once at launch.
 
-Based on [Chip-Biscuit's HP5 PC Fix](https://github.com/Chip-Biscuit/Harry-Potter-and-the-Order-of-the-Phoenix-PC-Fix) (which itself extends Elisha Riedlinger's generic D3D9 proxy wrapper). All additions described below are **new in this fork** — they do not exist in the upstream releases. License: [Unlicense](LICENSE) (public domain).
+This project began as a fork of Chip-Biscuit's HP5 PC Fix, itself built on Elisha Riedlinger's and ThirteenAG's generic D3D9 proxy wrapper. The original repository is no longer online, and the code here has grown far past it, so it is now maintained as an **independent project**. Everything described under "What this project adds" is new here and never existed in the original releases. License: [Unlicense](LICENSE) (public domain).
+
+The same wrapper is being adapted to *Half-Blood Prince* (HP6) and *Goblet of Fire* (HP4) in sister repositories.
 
 ---
 
-## What this fork adds
+## What this project adds
 
 | Feature | Default | What it does |
 |---|---|---|
@@ -40,12 +42,14 @@ Plus a handful of safety/QoL fixes:
 
 1. Install the game from your own copy or an archival source. Apply the NoDVD if needed (SecuROM).
 2. **Launch the game once**, open Video Options, set resolution to **640×480**, quit. This step is required by the wrapper chain — without it, `d3d9.dll` won't take effect on first run.
-3. Download the latest archive from this fork's **Releases** page.
+3. Download the latest archive from this project's **Releases** page.
 4. Extract into the game folder so that next to `hp.exe` you have:
-   - `d3d9.dll` (our wrapper)
-   - `d3d9_original.dll` (upstream wrapper — the chain layer below ours)
+   - `d3d9.dll` (this wrapper)
+   - `d3d9_original.dll` (Chip-Biscuit's HP5-specific wrapper — the chain layer below ours; it holds the resolution and aspect-ratio patches)
+   - `fps.dll` (frame-rate cap patch, loaded by `d3d9_original.dll`)
    - `d3d9.ini` (defaults tuned for HP5)
-5. *(Optional)* If you want the 60/120 FPS patch or the FOV / aspect-ratio overrides, drop in `fps.dll` from the [upstream releases](https://github.com/Chip-Biscuit/Harry-Potter-and-the-Order-of-the-Phoenix-PC-Fix/releases). Those features live in `fps.dll`, not in `d3d9.dll`.
+
+   The original repository that distributed `d3d9_original.dll` and `fps.dll` is gone; they are kept as-is (unmodified binaries).
 6. Launch. All settings are configurable in `d3d9.ini` — see below.
 
 After tweaking `d3d9.ini`, relaunch the game (the file is read once at DLL load — no hot-reload).
@@ -112,17 +116,17 @@ A luma-variance check from the FXAA pass is reused to skip AO on uniform-color r
 
 ### `[FORCEWINDOWED]` — windowed mode and Alt+Tab
 
-- **`FreeMouse`** (default `1`) — neutralizes the game's `ClipCursor` and `SetCapture` calls so the cursor can leave the window freely. Enables multi-monitor cursor movement, screenshot tools, the Windows key, and screenshots.
+- **`FreeMouse`** (default `1`) — meant to neutralize `ClipCursor` and `SetCapture` so the cursor can leave the window freely (multi-monitor, screenshot tools). **Known issue:** in the current release it has no effect — the call that confines the cursor comes from `d3d9_original.dll`, not from `hp.exe`, and only `hp.exe` was hooked. A fix is being validated on the HP6 version and will be brought back here.
 - **`DoNotNotifyOnTaskSwitch`** (default `1`) — swallows the `WM_ACTIVATEAPP(FALSE)` message HP5 reacts to on focus loss. Without this, Alt+Tabbing away can freeze the game on return. Works without `EnableHooks` because the wrapper subclasses HP5's window directly via `SetWindowLongPtr`.
 
 ### Alt+Tab behavior
 
 With the defaults above, Alt+Tab no longer freezes the game.
 
-- **Mouse recovers immediately** when you come back. The DirectInput8 proxy forces a re-Acquire on `WM_ACTIVATEAPP(TRUE)`.
-- **Keyboard recovers on its own after ~30 seconds.** HP5's main window only receives `WM_NCACTIVATE` after the first activation — `WM_ACTIVATE` / `WM_ACTIVATEAPP` / `WM_SETFOCUS` never make it to our wndproc subclass on Alt+Tab return, so we can't trigger a keyboard re-Acquire from a Win32 hook. The game's own DirectInput polling eventually times out and re-acquires the keyboard. The delay is constant. If you Alt+Tab once in a while, just wait; if you Alt+Tab very often, relaunching is faster than waiting.
+- **Mouse input works right away** when you come back.
+- **Keyboard recovers on its own after a delay (measured up to ~15–30 seconds).** HP5's main window only receives `WM_NCACTIVATE` after the first activation — `WM_ACTIVATE` / `WM_ACTIVATEAPP` / `WM_SETFOCUS` never make it to our wndproc subclass on Alt+Tab return, so we can't trigger a keyboard re-Acquire from a Win32 hook. The game's own DirectInput polling eventually times out and re-acquires the keyboard. The delay is constant. If you Alt+Tab once in a while, just wait; if you Alt+Tab very often, relaunching is faster than waiting.
 
-Six approaches to accelerate keyboard recovery were investigated and rejected — each one either failed to fire, broke the mouse path, or introduced a different regression. The 30-second wait is the documented tradeoff and is acceptable for normal play.
+Six message-driven approaches to accelerate keyboard recovery were investigated and rejected. A different approach — detecting the return to the foreground by polling instead of waiting for a window message — brought the keyboard back within 2 seconds in a prototype on HP6; it is being turned into a proper fix there.
 
 ### `[RESOLUTION]`
 
@@ -130,14 +134,14 @@ Six approaches to accelerate keyboard recovery were investigated and rejected �
 
 ### `[MAIN]`
 
-Mostly upstream — see comments in `d3d9.ini` for `FPSLimit`, `FPSLimitMode`, `FullScreenRefreshRateInHz`, `DisplayFPSCounter`, `ForceWindowedMode`. Two additions in this fork:
+Mostly inherited from the base wrapper — see comments in `d3d9.ini` for `FPSLimit`, `FPSLimitMode`, `FullScreenRefreshRateInHz`, `DisplayFPSCounter`, `ForceWindowedMode`. Two additions in this project:
 
 - **`ScreenshotKey`** (default `123` = F12) — virtual-key code of a screenshot hotkey that saves the final, post-processed frame as a PNG to `<gamedir>/screenshots/`. Exists because Win+PrtScr is unreliable over HP5's input handling. `44` = PrtScr, `0` = off.
 - **`DPIAware`** (default `1`) — opts the process out of Windows display scaling at DLL attach. Without it, on a scaled display (e.g. 150/160%) the borderless window is shrunk then blur-stretched by Windows and `GetMonitorInfo` reports a scaled-down desktop, so the game's resolution menu lists wrong modes. Leave at `1`.
 
 ### `[LAUNCHER]`
 
-Upstream section, used only by the standalone launcher binary — see `d3d9.ini` comments for `AppExe` / `AppArgs`.
+Section inherited from the base wrapper, used only by the standalone launcher binary — see `d3d9.ini` comments for `AppExe` / `AppArgs`.
 
 ---
 
@@ -157,11 +161,11 @@ Tail this file first if any feature seems silently absent — most "it didn't wo
 
 ## Footgun — leave `EnableHooks=0`
 
-The upstream wrapper exposes `EnableHooks=1` to install a process-wide IAT hook chain (`RegisterClassA/W/Ex`, `LoadLibraryA/W/Ex`, `FreeLibrary`, `GetProcAddress` across `hp.exe` + `ole32.dll` + `d3d9.dll`).
+The base wrapper exposes `EnableHooks=1` to install a process-wide IAT hook chain (`RegisterClassA/W/Ex`, `LoadLibraryA/W/Ex`, `FreeLibrary`, `GetProcAddress` across `hp.exe` + `ole32.dll` + `d3d9.dll`).
 
 **On HP5 specifically, this crashes the game at `DLL_PROCESS_ATTACH`.** Symptom: the log stops on `FreeMouse hooks installed` and you never see a window. Leave `EnableHooks=0` (the default).
 
-`DoNotNotifyOnTaskSwitch=1` works without `EnableHooks` even though the upstream comment says otherwise — the wrapper subclasses HP5's window directly, no IAT chain needed.
+`DoNotNotifyOnTaskSwitch=1` works without `EnableHooks` even though the base wrapper's comment says otherwise — the wrapper subclasses HP5's window directly, no IAT chain needed.
 
 ---
 
@@ -182,6 +186,6 @@ No tests, no lint config. CI (`appveyor.yml`) builds Release for both platforms.
 
 ## Credits
 
-- **Upstream HP5 fix**: [Chip-Biscuit](https://github.com/Chip-Biscuit) — original repository this fork is built on. The `fps.dll` (60/120 FPS, FOV, aspect ratio overrides) remains a Chip-Biscuit project and is distributed via the [upstream releases](https://github.com/Chip-Biscuit/Harry-Potter-and-the-Order-of-the-Phoenix-PC-Fix/releases).
-- **Base D3D9 wrapper**: Elisha Riedlinger / "13 AG" — the generic Direct3D 9 proxy this stack ultimately descends from.
-- **This fork's enhancements** (MSAA cascade, AF/LOD forcing, mipmap regeneration, FXAA + tunable sharpening, full color grade with white balance / contrast / split toning, SSAO with the INTZ pipeline + pre-UI depth-unbind pass, bloom + god-rays lighting pass with over-bright guard, F12 screenshots, DPI-aware opt-out, frame latency cap, DirectInput8 proxy + Alt+Tab mouse re-Acquire): added in this fork.
+- **Original HP5 fix**: [Chip-Biscuit](https://github.com/Chip-Biscuit) — this project started from his HP5 PC Fix. His game-specific binaries (`d3d9_original.dll`, `fps.dll`: resolution, aspect ratio, frame-rate cap) are still shipped unmodified, under the Unlicense. His repository is no longer online.
+- **Base D3D9 wrapper**: Elisha Riedlinger / ThirteenAG — the generic Direct3D 9 proxy this stack ultimately descends from.
+- **This project's enhancements** (MSAA cascade, AF/LOD forcing, mipmap regeneration, FXAA + tunable sharpening, full color grade with white balance / contrast / split toning, SSAO with the INTZ pipeline + pre-UI depth-unbind pass, bloom + god-rays lighting pass with over-bright guard, F12 screenshots, DPI-aware opt-out, frame latency cap, DirectInput8 proxy + Alt+Tab mouse re-Acquire): added in this project.
