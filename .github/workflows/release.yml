@@ -1,0 +1,200 @@
+# Manual release, started from the Actions tab ("Run workflow").
+#
+# - Box unchecked (default): trial build. Compiles, verifies and packages
+#   the release files as an artifact; nothing is published.
+# - Box checked: same, then creates a DRAFT release (tag v<VERSION>) with
+#   d3d9.dll, d3d9.ini, license and THIRD_PARTY_NOTICES.md, and a signed
+#   build provenance attestation for d3d9.dll. The draft stays private until
+#   it is published by hand; the tag is only created at that point.
+#
+# The tag comes from the VERSION file. The run is refused if that tag, or a
+# release (draft included) using it, already exists.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Créer la release (brouillon). Décoché : simple build d'essai, rien n'est publié."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read VERSION and check the tag
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CREATE_RELEASE: ${{ inputs.create_release }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          version=$(tr -d '[:space:]' < VERSION)
+          if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error file=VERSION::VERSION must be MAJOR.MINOR.PATCH (e.g. 1.0.0), got '$version'."
+            exit 1
+          fi
+          tag="v$version"
+
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --silent 2> gh-error.txt; then
+            if [[ $CREATE_RELEASE == true ]]; then
+              echo "::error file=VERSION::Tag $tag already exists. Bump VERSION before creating a release."
+              exit 1
+            fi
+            echo "::warning file=VERSION::Tag $tag already exists: a release would be refused. Bump VERSION first."
+          elif ! grep -q 'HTTP 404' gh-error.txt; then
+            cat gh-error.txt
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [[ $CREATE_RELEASE == true ]]; then mode='draft release'; else mode='trial build, nothing published'; fi
+          echo "### $tag ($mode)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ $GITHUB_REF != "refs/heads/$DEFAULT_BRANCH" ]]; then
+            echo "::warning::Running from $GITHUB_REF_NAME, not from $DEFAULT_BRANCH."
+          fi
+
+  build:
+    name: Build
+    needs: version
+    uses: ./.github/workflows/build.yml
+
+  package:
+    name: Package
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download d3d9.dll
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: build-output
+
+      - name: Assemble files and release notes
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          DLL_SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          (cd build-output && sha256sum --check --strict d3d9.dll.sha256)
+          actual=$(sha256sum build-output/d3d9.dll | cut -d' ' -f1)
+          if [[ $actual != "$DLL_SHA256" ]]; then
+            echo "::error::d3d9.dll SHA-256 is $actual, the build reported $DLL_SHA256."
+            exit 1
+          fi
+
+          mkdir release
+          cp build-output/d3d9.dll data/d3d9.ini license THIRD_PARTY_NOTICES.md release/
+
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            echo "Built by GitHub Actions from commit \`$GITHUB_SHA\` ([run]($run_url))."
+            echo
+            echo "**\`d3d9.dll\` SHA-256:** \`$DLL_SHA256\`"
+            echo
+            echo "| File | SHA-256 |"
+            echo "|---|---|"
+            for file in d3d9.dll d3d9.ini license THIRD_PARTY_NOTICES.md; do
+              echo "| \`$file\` | \`$(sha256sum "release/$file" | cut -d' ' -f1)\` |"
+            done
+            echo
+            echo "Check a download with \`Get-FileHash d3d9.dll\` (PowerShell) or \`sha256sum d3d9.dll\` (Linux)."
+            echo "\`d3d9.dll\` also has a signed build provenance attestation:"
+            echo
+            echo '```'
+            echo "gh attestation verify d3d9.dll --repo $GITHUB_REPOSITORY"
+            echo '```'
+            echo
+            echo "\`d3d9_original.dll\` and \`fps.dll\` (Chip-Biscuit, Unlicense) are not included in this release."
+          } > release-notes.md
+
+          cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
+          ls -l release
+
+      - name: Upload release files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ needs.version.outputs.tag }}
+          path: |
+            release/
+            release-notes.md
+          if-no-files-found: error
+
+  publish:
+    name: Draft release
+    if: ${{ inputs.create_release }}
+    needs: [version, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the draft release
+      id-token: write # sign the attestation (Sigstore)
+      attestations: write # store the attestation
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-${{ needs.version.outputs.tag }}
+
+      - name: Check the tag and existing releases again
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --silent 2> gh-error.txt; then
+            echo "::error::Tag $TAG already exists. Bump VERSION before creating a release."
+            exit 1
+          elif ! grep -q 'HTTP 404' gh-error.txt; then
+            cat gh-error.txt
+            exit 1
+          fi
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq ".[] | select(.tag_name == \"$TAG\") | .html_url")
+          if [[ -n $existing ]]; then
+            echo "::error::A release for $TAG already exists (it may be a draft): $existing. Delete it or bump VERSION."
+            exit 1
+          fi
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/d3d9.dll
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          url=$(gh release create "$TAG" \
+            release/d3d9.dll release/d3d9.ini release/license release/THIRD_PARTY_NOTICES.md \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file release-notes.md)
+          echo "Draft release: $url"
+          echo "### Draft release created: $url" >> "$GITHUB_STEP_SUMMARY"
+          echo "Review it, then publish it by hand. The $TAG tag is created on publication." >> "$GITHUB_STEP_SUMMARY"

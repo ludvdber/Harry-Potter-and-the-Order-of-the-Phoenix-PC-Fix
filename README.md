@@ -180,7 +180,35 @@ Toolchain: **Visual Studio 2022**, C++. Targets Win32 (the game is 32-bit) and W
 
 Output: `data/d3d9.dll` (Win32) or `data/x64/d3d9.dll` (Win64). Drop it into the game folder along with `d3d9.ini`.
 
-No tests, no lint config. CI (`appveyor.yml`) builds Release for both platforms.
+No tests, no lint config. CI: GitHub Actions builds Release Win32 on every push and pull request — see [Compiler sans Windows](#compiler-sans-windows).
+
+---
+
+## Compiler sans Windows
+
+Tout se fait depuis l'onglet **Actions** du dépôt sur GitHub : la compilation tourne sur une machine Windows fournie par GitHub, rien à installer.
+
+**Build automatique.** Chaque push et chaque pull request lance le workflow **Build**. Pour récupérer la DLL : **Actions** → **Build** (colonne de gauche) → cliquer sur le run → en bas de la page, section **Artifacts** → `d3d9-win32` (zip contenant `d3d9.dll` et `d3d9.dll.sha256`). L'empreinte SHA-256 est aussi affichée dans le résumé du run. Le run échoue si la compilation échoue ou si la DLL produite n'est pas une DLL 32 bits.
+
+**Build d'essai (rien n'est publié).**
+
+1. Onglet **Actions** → **Release** dans la colonne de gauche.
+2. Bouton **Run workflow** (à droite, au-dessus de la liste des runs).
+3. *Use workflow from* : `main`. Laisser la case **Créer la release** décochée.
+4. Cliquer le bouton vert **Run workflow**, puis sur le run qui apparaît.
+5. Une fois le run vert, section **Artifacts** → `release-v<VERSION>` : les quatre fichiers de la future release et `release-notes.md`.
+
+**Créer une release.**
+
+1. Mettre à jour le fichier `VERSION` (par exemple `1.0.1`) : l'ouvrir sur GitHub → icône crayon → changer le numéro → **Commit changes**. Le tag sera `v` suivi de ce numéro.
+2. **Actions** → **Release** → **Run workflow** → *Use workflow from* : `main` → cocher **Créer la release** → **Run workflow**.
+3. Le run refuse de continuer si le tag `v<VERSION>` existe déjà, ou si une release (même brouillon) l'utilise : incrémenter `VERSION` ou supprimer ce brouillon, puis relancer.
+4. Une fois le run vert, page d'accueil du dépôt → **Releases** → le brouillon `v<VERSION>` contient `d3d9.dll`, `d3d9.ini`, `license` et `THIRD_PARTY_NOTICES.md`, avec l'empreinte SHA-256 dans les notes. Relire, puis crayon (**Edit**) → **Publish release**. Le tag n'est créé qu'à ce moment-là.
+5. Tant que ce bouton n'est pas cliqué, rien n'est public. Pour abandonner : **Delete** sur le brouillon.
+
+`d3d9.dll` reçoit une attestation de provenance signée ; pour vérifier un fichier téléchargé : `sha256sum d3d9.dll` et `gh attestation verify d3d9.dll --repo ludvdber/Harry-Potter-and-the-Order-of-the-Phoenix-PC-Fix`.
+
+Les actions utilisées par les workflows sont épinglées par empreinte de commit. Dependabot ouvre chaque semaine une pull request pour les mettre à jour : le build tourne dessus, il suffit de la fusionner si elle est verte.
 
 ---
 
