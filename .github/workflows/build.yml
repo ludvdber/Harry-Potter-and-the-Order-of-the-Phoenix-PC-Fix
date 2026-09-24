@@ -81,11 +81,12 @@ jobs:
           $bytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $dll))
           if ($bytes.Length -lt 0x40 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { Fail 'no MZ header.' }
           $pe = [BitConverter]::ToInt32($bytes, 0x3C)
-          if ($pe -lt 0x40 -or $pe + 26 -gt $bytes.Length) { Fail 'truncated PE header.' }
+          if ($pe -lt 0x40 -or $pe + 28 -gt $bytes.Length) { Fail 'truncated PE header.' }
           if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x00004550) { Fail 'no PE signature.' }
           $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
           $characteristics = [BitConverter]::ToUInt16($bytes, $pe + 22)
           $magic = [BitConverter]::ToUInt16($bytes, $pe + 24)
+          $linker = '{0}.{1:D2}' -f $bytes[$pe + 26], $bytes[$pe + 27] # 14.3x-14.4x: v143, 14.5x: v145
           if ($machine -ne 0x014C) { Fail ('machine is 0x{0:X4}, expected 0x014C (x86).' -f $machine) }
           if ($magic -ne 0x010B) { Fail ('optional header magic is 0x{0:X3}, expected 0x10B (PE32).' -f $magic) }
           if (($characteristics -band 0x2000) -eq 0) { Fail 'IMAGE_FILE_DLL flag not set, this is not a DLL.' }
@@ -95,13 +96,14 @@ jobs:
           "sha256=$sha256" >> $env:GITHUB_OUTPUT
 
           $size = $bytes.Length
-          Write-Output "d3d9.dll: PE32 DLL, x86, $size bytes, SHA-256 $sha256"
+          Write-Output "d3d9.dll: PE32 DLL, x86, linker $linker, $size bytes, SHA-256 $sha256"
           @(
             '### d3d9.dll (Release | Win32)'
             ''
             '| | |'
             '|---|---|'
             '| Format | PE32 DLL, x86 (32-bit) |'
+            "| Linker | $linker |"
             ('| Size | {0:N0} bytes ({1:N0} KiB) |' -f $size, [math]::Round($size / 1KB))
             "| SHA-256 | ``$sha256`` |"
             "| Commit | ``$env:GITHUB_SHA`` |"
