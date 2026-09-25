@@ -71,6 +71,49 @@ static void UntrackDeviceW(LPDIRECTINPUTDEVICE8W dev)
 	LeaveCriticalSection(&g_diLock);
 }
 
+// First call of each kind per device, with its kind: tells which device the game polls
+// (state) and which it reads as events (buffered data). Diagnostic, cheap after the first call.
+static void NoteFirstCall(void* dev, const char* call, DWORD arg)
+{
+	static struct { void* dev; const char* call; } seen[64];
+	static int count = 0;
+	InitDILockOnce();
+	EnterCriticalSection(&g_diLock);
+	for (int i = 0; i < count; i++)
+		if (seen[i].dev == dev && seen[i].call == call) { LeaveCriticalSection(&g_diLock); return; }
+	if (count < 64) { seen[count].dev = dev; seen[count].call = call; count++; }
+	const char* kind = "?";
+	for (auto& d : g_diDevsA) if ((void*)d.first == dev) kind = d.second == DIK_Keyboard ? "keyboard" : "mouse/other";
+	for (auto& d : g_diDevsW) if ((void*)d.first == dev) kind = d.second == DIK_Keyboard ? "keyboard" : "mouse/other";
+	LeaveCriticalSection(&g_diLock);
+	WrapperLog("DirectInput: %s %p first %s (%lu)\n", kind, dev, call, arg);
+}
+
+// A key released while the game is in the background never reaches DirectInput, which then
+// keeps reporting it down after the return. Measured on HP6 (2026-09-25): W stayed down 4.7 s
+// after an Alt+Tab taken while walking, until the key was pressed again, and Harry walked on
+// his own. Keys that DirectInput reports down at the return are therefore shown to the game
+// as up until DirectInput sees them released, unless Windows says they are really held now.
+static void FilterStaleKeys(BYTE* keys, BYTE* stale, bool returned, void* dev)
+{
+	if (returned)
+	{
+		int n = 0;
+		for (int k = 0; k < 256; k++) { stale[k] = (keys[k] & 0x80) ? 1 : 0; n += stale[k]; }
+		if (n) WrapperLog("DirectInput: keyboard %p, %d key(s) still reported down at the return, held back until released\n", dev, n);
+	}
+	for (int k = 0; k < 256; k++)
+	{
+		if (!stale[k]) continue;
+		if (!(keys[k] & 0x80)) { stale[k] = 0; continue; }
+		// DIK codes are scan codes; the extended ones carry 0x80 instead of the E0 prefix.
+		const UINT sc = (k & 0x80) ? (0xE000 | (k & 0x7F)) : (UINT)k;
+		const UINT vk = MapVirtualKeyA(sc, MAPVK_VSC_TO_VK_EX);
+		if (vk && (GetAsyncKeyState((int)vk) & 0x8000)) { stale[k] = 0; continue; }
+		keys[k] = 0;
+	}
+}
+
 void DirectInputReAcquireMice()
 {
 	if (!g_diLockInit) return;
@@ -83,9 +126,119 @@ void DirectInputReAcquireMice()
 	WrapperLog("DirectInput: re-acquired mice %d/%d ok\n", ok, n);
 }
 
+// ---- Re-Acquire on return to the foreground, detected by polling ----
+extern volatile LONG g_presentCount; // dllmain.cpp
+static volatile LONG g_fgGeneration = 0;
+static volatile LONG g_wasForeground = 1;
+
+// The foreground window, asked of user32 itself rather than through our import table: with
+// DoNotNotifyOnTaskSwitch = 1 the wrapper below us patches import tables so the game keeps
+// believing it is in front. Through our own import, the watcher saw the game in front during a
+// whole Alt+Tab (2026-09-25); Frida, calling the export directly, saw the truth.
+using GetForegroundWindowFn = HWND(WINAPI*)();
+static GetForegroundWindowFn RealGetForegroundWindow()
+{
+	static GetForegroundWindowFn fn = (GetForegroundWindowFn)GetProcAddress(GetModuleHandleA("user32.dll"), "GetForegroundWindow");
+	return fn ? fn : GetForegroundWindow;
+}
+
+// The system call behind it (win32u, Windows 10+). With DoNotNotifyOnTaskSwitch = 1, user32's
+// own GetForegroundWindow ALSO kept answering "the game" during an Alt+Tab (2026-09-25): the
+// patch is in the function itself, not only in import tables. No user32 patch reaches this one.
+static GetForegroundWindowFn KernelGetForegroundWindow()
+{
+	static GetForegroundWindowFn fn = []() -> GetForegroundWindowFn {
+		HMODULE w = GetModuleHandleA("win32u.dll");
+		if (!w) w = LoadLibraryA("win32u.dll");
+		return w ? (GetForegroundWindowFn)GetProcAddress(w, "NtUserGetForegroundWindow") : nullptr;
+	}();
+	return fn ? fn : RealGetForegroundWindow();
+}
+
+static DWORD ForegroundPid(HWND w)
+{
+	DWORD pid = 0;
+	GetWindowThreadProcessId(w, &pid);
+	return pid;
+}
+
+static bool ProcessOwnsForeground()
+{
+	return ForegroundPid(KernelGetForegroundWindow()()) == GetCurrentProcessId();
+}
+
+static LONG UpdateForegroundState()
+{
+	const LONG fg = ProcessOwnsForeground() ? 1 : 0;
+	const LONG before = InterlockedExchange(&g_wasForeground, fg);
+	if (fg && !before)
+	{
+		const LONG gen = InterlockedIncrement(&g_fgGeneration);
+		WrapperLog("DirectInput: back in the foreground (return #%ld, frame %ld), re-acquiring devices\n", gen, g_presentCount);
+		return gen;
+	}
+	if (!fg && before) WrapperLog("DirectInput: left the foreground (frame %ld)\n", g_presentCount);
+	return g_fgGeneration;
+}
+
+// The loss of focus must be seen even if the game stops reading its devices while unfocused;
+// sampling only inside GetDeviceState never observed it. A watcher thread samples the
+// foreground on its own; the device reads only compare generations.
+static DWORD WINAPI ForegroundWatcher(LPVOID)
+{
+	for (;;)
+	{
+		UpdateForegroundState();
+		Sleep(100);
+	}
+}
+
+LONG DirectInputForegroundGeneration()
+{
+	static volatile LONG s_started = 0;
+	if (InterlockedExchange(&s_started, 1) == 0)
+	{
+		DWORD tid = 0;
+		HANDLE h = CreateThread(nullptr, 0, ForegroundWatcher, nullptr, 0, &tid);
+		WrapperLog("DirectInput: foreground watcher %s (tid %lu)\n", h ? "started" : "FAILED to start", tid);
+		if (h) CloseHandle(h);
+	}
+	return UpdateForegroundState();
+}
+
+bool m_IDirectInputDevice8A::ReAcquireIfForegroundReturned()
+{
+	const LONG gen = DirectInputForegroundGeneration();
+	if (gen == SeenForegroundGeneration) return false;
+	SeenForegroundGeneration = gen;
+	ProxyInterface->Unacquire();
+	const HRESULT hr = ProxyInterface->Acquire();
+	WrapperLog("DirectInput[A]: device %p re-acquired after foreground return, hr=0x%X\n", ProxyInterface, hr);
+	return true;
+}
+
+bool m_IDirectInputDevice8W::ReAcquireIfForegroundReturned()
+{
+	const LONG gen = DirectInputForegroundGeneration();
+	if (gen == SeenForegroundGeneration) return false;
+	SeenForegroundGeneration = gen;
+	ProxyInterface->Unacquire();
+	const HRESULT hr = ProxyInterface->Acquire();
+	WrapperLog("DirectInput[W]: device %p re-acquired after foreground return, hr=0x%X\n", ProxyInterface, hr);
+	return true;
+}
+
 // ---- m_IDirectInputDevice8A ----
 
-HRESULT m_IDirectInputDevice8A::QueryInterface(REFIID riid, LPVOID* ppvObj) { return ProxyInterface->QueryInterface(riid, ppvObj); }
+HRESULT m_IDirectInputDevice8A::QueryInterface(REFIID riid, LPVOID* ppvObj)
+{
+	HRESULT hr = ProxyInterface->QueryInterface(riid, ppvObj);
+	// Same object asked for again (HP6 re-queries its devices): hand back the wrapper.
+	// Returning the raw pointer silently took every later call - GetDeviceState
+	// included - out of the wrapper, so nothing done here ever ran.
+	if (SUCCEEDED(hr) && ppvObj && *ppvObj == (LPVOID)ProxyInterface) *ppvObj = this;
+	return hr;
+}
 ULONG   m_IDirectInputDevice8A::AddRef() { return ProxyInterface->AddRef(); }
 ULONG   m_IDirectInputDevice8A::Release()
 {
@@ -102,6 +255,8 @@ HRESULT m_IDirectInputDevice8A::Acquire() { return ProxyInterface->Acquire(); }
 HRESULT m_IDirectInputDevice8A::Unacquire() { return ProxyInterface->Unacquire(); }
 HRESULT m_IDirectInputDevice8A::GetDeviceState(DWORD c, LPVOID d)
 {
+	NoteFirstCall(ProxyInterface, "GetDeviceState", c);
+	const bool returned = ReAcquireIfForegroundReturned();
 	HRESULT hr = ProxyInterface->GetDeviceState(c, d);
 	if (IsInputLost(hr))
 	{
@@ -109,10 +264,13 @@ HRESULT m_IDirectInputDevice8A::GetDeviceState(DWORD c, LPVOID d)
 		if (SUCCEEDED(ProxyInterface->Acquire()))
 			hr = ProxyInterface->GetDeviceState(c, d);
 	}
+	if (c == 256 && SUCCEEDED(hr)) FilterStaleKeys((BYTE*)d, StaleKeys, returned, ProxyInterface);
 	return hr;
 }
 HRESULT m_IDirectInputDevice8A::GetDeviceData(DWORD c, LPDIDEVICEOBJECTDATA r, LPDWORD p, DWORD f)
 {
+	NoteFirstCall(ProxyInterface, "GetDeviceData", p ? *p : 0);
+	ReAcquireIfForegroundReturned();
 	HRESULT hr = ProxyInterface->GetDeviceData(c, r, p, f);
 	if (IsInputLost(hr))
 	{
@@ -154,7 +312,15 @@ HRESULT m_IDirectInputDevice8A::GetImageInfo(LPDIDEVICEIMAGEINFOHEADERA p) { ret
 
 // ---- m_IDirectInputDevice8W ----
 
-HRESULT m_IDirectInputDevice8W::QueryInterface(REFIID riid, LPVOID* ppvObj) { return ProxyInterface->QueryInterface(riid, ppvObj); }
+HRESULT m_IDirectInputDevice8W::QueryInterface(REFIID riid, LPVOID* ppvObj)
+{
+	HRESULT hr = ProxyInterface->QueryInterface(riid, ppvObj);
+	// Same object asked for again (HP6 re-queries its devices): hand back the wrapper.
+	// Returning the raw pointer silently took every later call - GetDeviceState
+	// included - out of the wrapper, so nothing done here ever ran.
+	if (SUCCEEDED(hr) && ppvObj && *ppvObj == (LPVOID)ProxyInterface) *ppvObj = this;
+	return hr;
+}
 ULONG   m_IDirectInputDevice8W::AddRef() { return ProxyInterface->AddRef(); }
 ULONG   m_IDirectInputDevice8W::Release()
 {
@@ -171,6 +337,8 @@ HRESULT m_IDirectInputDevice8W::Acquire() { return ProxyInterface->Acquire(); }
 HRESULT m_IDirectInputDevice8W::Unacquire() { return ProxyInterface->Unacquire(); }
 HRESULT m_IDirectInputDevice8W::GetDeviceState(DWORD c, LPVOID d)
 {
+	NoteFirstCall(ProxyInterface, "GetDeviceState", c);
+	const bool returned = ReAcquireIfForegroundReturned();
 	HRESULT hr = ProxyInterface->GetDeviceState(c, d);
 	if (IsInputLost(hr))
 	{
@@ -178,10 +346,13 @@ HRESULT m_IDirectInputDevice8W::GetDeviceState(DWORD c, LPVOID d)
 		if (SUCCEEDED(ProxyInterface->Acquire()))
 			hr = ProxyInterface->GetDeviceState(c, d);
 	}
+	if (c == 256 && SUCCEEDED(hr)) FilterStaleKeys((BYTE*)d, StaleKeys, returned, ProxyInterface);
 	return hr;
 }
 HRESULT m_IDirectInputDevice8W::GetDeviceData(DWORD c, LPDIDEVICEOBJECTDATA r, LPDWORD p, DWORD f)
 {
+	NoteFirstCall(ProxyInterface, "GetDeviceData", p ? *p : 0);
+	ReAcquireIfForegroundReturned();
 	HRESULT hr = ProxyInterface->GetDeviceData(c, r, p, f);
 	if (IsInputLost(hr))
 	{
@@ -223,7 +394,15 @@ HRESULT m_IDirectInputDevice8W::GetImageInfo(LPDIDEVICEIMAGEINFOHEADERW p) { ret
 
 // ---- m_IDirectInput8A ----
 
-HRESULT m_IDirectInput8A::QueryInterface(REFIID riid, LPVOID* ppvObj) { return ProxyInterface->QueryInterface(riid, ppvObj); }
+HRESULT m_IDirectInput8A::QueryInterface(REFIID riid, LPVOID* ppvObj)
+{
+	HRESULT hr = ProxyInterface->QueryInterface(riid, ppvObj);
+	// Same object asked for again (HP6 re-queries its devices): hand back the wrapper.
+	// Returning the raw pointer silently took every later call - GetDeviceState
+	// included - out of the wrapper, so nothing done here ever ran.
+	if (SUCCEEDED(hr) && ppvObj && *ppvObj == (LPVOID)ProxyInterface) *ppvObj = this;
+	return hr;
+}
 ULONG   m_IDirectInput8A::AddRef() { return ProxyInterface->AddRef(); }
 ULONG   m_IDirectInput8A::Release()
 {
@@ -255,7 +434,15 @@ HRESULT m_IDirectInput8A::ConfigureDevices(LPDICONFIGUREDEVICESCALLBACK c, LPDIC
 
 // ---- m_IDirectInput8W ----
 
-HRESULT m_IDirectInput8W::QueryInterface(REFIID riid, LPVOID* ppvObj) { return ProxyInterface->QueryInterface(riid, ppvObj); }
+HRESULT m_IDirectInput8W::QueryInterface(REFIID riid, LPVOID* ppvObj)
+{
+	HRESULT hr = ProxyInterface->QueryInterface(riid, ppvObj);
+	// Same object asked for again (HP6 re-queries its devices): hand back the wrapper.
+	// Returning the raw pointer silently took every later call - GetDeviceState
+	// included - out of the wrapper, so nothing done here ever ran.
+	if (SUCCEEDED(hr) && ppvObj && *ppvObj == (LPVOID)ProxyInterface) *ppvObj = this;
+	return hr;
+}
 ULONG   m_IDirectInput8W::AddRef() { return ProxyInterface->AddRef(); }
 ULONG   m_IDirectInput8W::Release()
 {
@@ -315,6 +502,13 @@ void InstallDirectInputHook()
 		mainModule, "dinput8.dll",
 		std::make_tuple("DirectInput8Create", (void*)hk_DirectInput8Create)
 	);
+	// HP4 ships GofInput.dll, which imports DirectInput8Create too. gof_f.exe does not name it
+	// anywhere, so it is probably never loaded; hooked anyway if it is, and the log says which.
+	if (HMODULE gof = GetModuleHandleA("GofInput.dll"))
+	{
+		auto gofOriginals = IATHook::Replace(gof, "dinput8.dll", std::make_tuple("DirectInput8Create", (void*)hk_DirectInput8Create));
+		WrapperLog("DirectInput: GofInput.dll loaded, DirectInput8Create %s\n", gofOriginals.empty() ? "not imported" : "hooked");
+	}
 
 	auto it = originals.find("DirectInput8Create");
 	if (it != originals.end())

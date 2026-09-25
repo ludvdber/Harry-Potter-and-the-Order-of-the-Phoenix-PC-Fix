@@ -26,7 +26,7 @@ The same wrapper is being adapted to *Half-Blood Prince* (HP6) and *Goblet of Fi
 | **Bloom + god-rays lighting pass** | off | Half-resolution light pipeline composited in the FXAA pass: a bright-pass + two-iteration Gaussian bloom, plus crepuscular light shafts radiating from the brightest **on-screen** source (auto-detected via a 64×64 readback). An automatic over-bright guard fades both out on 2D menus / near-white screens so they don't wash out. |
 | **Full color grade folded into the FXAA pass** | on, subtle | ASC-CDL Lift / Gain → Gamma → white balance (Temperature / Tint) → contrast S-curve → Vibrance → split toning (teal/orange) → Vignette, all sharing the FXAA shader so it costs zero extra draw call. Defaults give HP5's flat 2007 look a modern pop without making it look like a different game. |
 | **`SetMaximumFrameLatency(1)`** | always on | Cuts input lag from the Windows default of 3 frames down to 1, on any device that exposes `IDirect3DDevice9Ex` (every Vista+ driver). Perceptible above 60 FPS. |
-| **DirectInput8 proxy + Alt+Tab mouse re-Acquire** | always on | Proxies `IDirectInput8A/W` and `IDirectInputDevice8A/W`. Mouse devices are tracked and force-re-Acquired on `WM_ACTIVATEAPP(TRUE)`. Mouse comes back immediately on Alt+Tab return — no relaunching the game. |
+| **DirectInput8 proxy + Alt+Tab recovery** | always on | Proxies `IDirectInput8A/W` and `IDirectInputDevice8A/W`. The return to the foreground is detected by polling (the game receives no activation message), and keyboard and mouse are re-acquired at once. Keys released while you were in another window are released for the game too, so Harry doesn't keep walking on his own. |
 | **Per-launch diagnostics log** | always on | Every launch writes `d3d9_wrapper.log` next to `hp.exe` listing exactly what engaged on your hardware: INTZ support, MSAA cascade result, AF/LOD overrides, FXAA shader compile status, DI8 wrapper status. Tail this file first if anything looks off. |
 
 Plus a handful of safety/QoL fixes:
@@ -58,7 +58,9 @@ After tweaking `d3d9.ini`, relaunch the game (the file is read once at DLL load 
 
 ## `d3d9.ini` reference
 
-### `[GRAPHICS]` — anti-aliasing and texture filtering
+The file is organised in sections: `[MAIN]` and `[FORCEWINDOWED]` are read by both this wrapper and `d3d9_original.dll`, `[Accio.Window]` and `[Accio.Graphics]` by this wrapper only, `[RESOLUTION]` by `d3d9_original.dll` only. An ini written before 2026-09-25 (with `[GRAPHICS]`) still works: missing keys are read from their old place, except the old `[RESOLUTION] Width/Height`, which no longer forces the render size.
+
+### `[Accio.Graphics]` — anti-aliasing and texture filtering
 
 - **`FXAA`** (default `1`) — post-process AA + adaptive sharpening. Also gates color grading, SSAO and the lighting pass — turning FXAA off disables all of them. Near-zero cost.
 - **`Sharpness`** (default `0.40`) — strength of the FXAA pass's adaptive sharpening. `0` = pure AA, no sharpening. Overshoot is clamped to the local neighbourhood so it can't crawl on edges. Range `0.0..1.0`.
@@ -114,34 +116,33 @@ A luma-variance check from the FXAA pass is reused to skip AO on uniform-color r
 
 `SetMaximumFrameLatency(1)` is called automatically right after device creation on any `IDirect3DDevice9Ex` device. Cuts input lag from 3 frames to 1. No ini option — always on.
 
-### `[FORCEWINDOWED]` — windowed mode and Alt+Tab
+### `[FORCEWINDOWED]` and `[Accio.Window]` — windowed mode and Alt+Tab
 
-- **`FreeMouse`** (default `1`) — meant to neutralize `ClipCursor` and `SetCapture` so the cursor can leave the window freely (multi-monitor, screenshot tools). **Known issue:** in the current release it has no effect — the call that confines the cursor comes from `d3d9_original.dll`, not from `hp.exe`, and only `hp.exe` was hooked. A fix is being validated on the HP6 version and will be brought back here.
-- **`DoNotNotifyOnTaskSwitch`** (default `1`) — swallows the `WM_ACTIVATEAPP(FALSE)` message HP5 reacts to on focus loss. Without this, Alt+Tabbing away can freeze the game on return. Works without `EnableHooks` because the wrapper subclasses HP5's window directly via `SetWindowLongPtr`.
+- **`DoNotNotifyOnTaskSwitch`** (`[FORCEWINDOWED]`, default `1`) — keeps the game running when it loses focus instead of freezing. Read by both DLLs.
+- **`FreeMouse`** (`[Accio.Window]`, default `1`) — lets the cursor leave the game window (other monitors, Alt+Tab). The call that traps it comes from `d3d9_original.dll`, whose imports are patched as well as `hp.exe`'s.
 
 ### Alt+Tab behavior
 
-With the defaults above, Alt+Tab no longer freezes the game.
+With the defaults above:
 
-- **Mouse input works right away** when you come back.
-- **Keyboard recovers on its own after a delay (measured up to ~15–30 seconds).** HP5's main window only receives `WM_NCACTIVATE` after the first activation — `WM_ACTIVATE` / `WM_ACTIVATEAPP` / `WM_SETFOCUS` never make it to our wndproc subclass on Alt+Tab return, so we can't trigger a keyboard re-Acquire from a Win32 hook. The game's own DirectInput polling eventually times out and re-acquires the keyboard. The delay is constant. If you Alt+Tab once in a while, just wait; if you Alt+Tab very often, relaunching is faster than waiting.
+- the game keeps running while you are in another window;
+- **keyboard and mouse answer at once** when you come back — the return is detected by polling the foreground window, and the devices are re-acquired;
+- a key you released while away (say, the one you were walking with) is released for the game too.
 
-Six message-driven approaches to accelerate keyboard recovery were investigated and rejected. A different approach — detecting the return to the foreground by polling instead of waiting for a window message — brought the keyboard back within 2 seconds in a prototype on HP6; it is being turned into a proper fix there.
+The game takes the mouse and keyboard in DirectInput *exclusive* mode, as it always did: a click on another monitor does not leave the game (use Alt+Tab), and the Windows key stays disabled in game.
 
-### `[RESOLUTION]`
+### Render size — `RenderWidth` / `RenderHeight` in `[Accio.Graphics]`
 
-- **`Width` / `Height`** (default `0`) — `0` = use the game's own resolution. **Recommended: leave these at `0` and pick your resolution in the game's own options menu** (with `DPIAware=1` it now lists your real native modes). Forcing a resolution here that differs from the game's own setting — especially a different aspect ratio, or `-1` (monitor native) — desyncs the game's reflection/projection rendering from the back buffer and produces **translucent "ghost duplicate" characters**. Set the resolution in-game and these two stay in sync. `-1` is kept for advanced use but documented as may-ghost.
+- **`RenderWidth` / `RenderHeight`** (default `0`) — `0` = use the game's own resolution. **Recommended: leave these at `0` and pick your resolution in the game's own options menu** (with `DPIAware=1` it now lists your real native modes). Forcing a resolution here that differs from the game's own setting — especially a different aspect ratio, or `-1` (monitor native) — desyncs the game's reflection/projection rendering from the back buffer and produces **translucent "ghost duplicate" characters**. Set the resolution in-game and these two stay in sync. `-1` is kept for advanced use but documented as may-ghost.
 
-### `[MAIN]`
+`[RESOLUTION] Width / Height` belongs to `d3d9_original.dll` (window size and its own resolution patch).
 
-Mostly inherited from the base wrapper — see comments in `d3d9.ini` for `FPSLimit`, `FPSLimitMode`, `FullScreenRefreshRateInHz`, `DisplayFPSCounter`, `ForceWindowedMode`. Two additions in this project:
+### `[Accio.Window]`
+
+See the comments in `d3d9.ini` for `DisplayFPSCounter`, `FullScreenRefreshRateInHz`, and this wrapper's own `FPSLimit` / `FPSLimitMode` (off by default). Two additions in this project:
 
 - **`ScreenshotKey`** (default `123` = F12) — virtual-key code of a screenshot hotkey that saves the final, post-processed frame as a PNG to `<gamedir>/screenshots/`. Exists because Win+PrtScr is unreliable over HP5's input handling. `44` = PrtScr, `0` = off.
 - **`DPIAware`** (default `1`) — opts the process out of Windows display scaling at DLL attach. Without it, on a scaled display (e.g. 150/160%) the borderless window is shrunk then blur-stretched by Windows and `GetMonitorInfo` reports a scaled-down desktop, so the game's resolution menu lists wrong modes. Leave at `1`.
-
-### `[LAUNCHER]`
-
-Section inherited from the base wrapper, used only by the standalone launcher binary — see `d3d9.ini` comments for `AppExe` / `AppArgs`.
 
 ---
 
@@ -163,7 +164,7 @@ Tail this file first if any feature seems silently absent — most "it didn't wo
 
 The base wrapper exposes `EnableHooks=1` to install a process-wide IAT hook chain (`RegisterClassA/W/Ex`, `LoadLibraryA/W/Ex`, `FreeLibrary`, `GetProcAddress` across `hp.exe` + `ole32.dll` + `d3d9.dll`).
 
-**On HP5 specifically, this crashes the game at `DLL_PROCESS_ATTACH`.** Symptom: the log stops on `FreeMouse hooks installed` and you never see a window. Leave `EnableHooks=0` (the default).
+**On HP5 specifically, this crashes the game at `DLL_PROCESS_ATTACH`.** Symptom: the log stops on the `FreeMouse` lines and you never see a window. Leave `EnableHooks=0` in `[Accio.Window]` (the default).
 
 `DoNotNotifyOnTaskSwitch=1` works without `EnableHooks` even though the base wrapper's comment says otherwise — the wrapper subclasses HP5's window directly, no IAT chain needed.
 

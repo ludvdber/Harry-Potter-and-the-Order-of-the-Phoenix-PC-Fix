@@ -25,15 +25,57 @@
 #pragma comment(lib, "d3dx9.lib")
 #pragma comment(lib, "winmm.lib") // needed for timeBeginPeriod()/timeEndPeriod()
 
+// d3d9.ini is shared with the wrapper chained below us (d3d9_original.dll), which cannot be
+// changed. [MAIN] and [FORCEWINDOWED] mean the same thing to both layers and are read by both
+// ON PURPOSE: on HP6 it is the lower layer's DoNotNotifyOnTaskSwitch that keeps the game alive
+// unfocused (it answers GetForegroundWindow itself; our message filtering alone left the game
+// frozen, 0 frames, 2026-09-25). Everything else of ours lives in [Accio.*]: the shared
+// [RESOLUTION] width/height once forced our back buffer to the lower layer's 1920x1080.
+// Our frame limiter too (Accio.Window FPSLimit): HP4's lower layer caps at 100 through
+// [MAIN] FPSLimit, and two limiters in a row would be one too many.
+#define INI_SHARED_MAIN   "MAIN"
+#define INI_SHARED_WINDOW "FORCEWINDOWED"
+#define INI_WINDOW        "Accio.Window"
+#define INI_GRAPHICS      "Accio.Graphics"
+
+// An ini written before the [Accio.*] sections existed (2026-09-25) keeps working: a key
+// missing from our section is read from where it used to live. Players customised these
+// files (SSAO, colour grading...), and a new DLL must not silently switch their image back
+// to defaults. Not for the render size: the old [RESOLUTION] Width/Height IS the conflict.
+static bool IniHasKey(const char* section, const char* key, const char* path)
+{
+	char buf[8];
+	return GetPrivateProfileStringA(section, key, "\x01", buf, sizeof(buf), path) != 1 || buf[0] != 1;
+}
+static UINT IniInt(const char* section, const char* legacy, const char* key, INT def, const char* path)
+{
+	if (!IniHasKey(section, key, path) && legacy) return GetPrivateProfileIntA(legacy, key, def, path);
+	return GetPrivateProfileIntA(section, key, def, path);
+}
+static DWORD IniString(const char* section, const char* legacy, const char* key, const char* def, char* out, DWORD size, const char* path)
+{
+	if (!IniHasKey(section, key, path) && legacy) return GetPrivateProfileStringA(legacy, key, def, out, size, path);
+	return GetPrivateProfileStringA(section, key, def, out, size, path);
+}
+
 static FILE* g_log = nullptr;
+static char g_logPath[MAX_PATH] = {};
+static CRITICAL_SECTION g_logLock;
+
+// Every line carries the time (ms since boot): without it, a line written at the close of the
+// game once passed for one written at the Alt+Tab (2026-09-25), and a whole evening went into
+// explaining a "silence" that never happened.
 void WrapperLog(const char* fmt, ...)
 {
 	if (!g_log) return;
+	EnterCriticalSection(&g_logLock);
+	fprintf(g_log, "[%llu] ", GetTickCount64());
 	va_list args;
 	va_start(args, fmt);
 	vfprintf(g_log, fmt, args);
 	va_end(args);
 	fflush(g_log);
+	LeaveCriticalSection(&g_logLock);
 }
 
 // Surface-creation census for the shadow-map investigation: log every render-target / depth
@@ -68,6 +110,7 @@ HWND g_hFocusWindow = NULL;
 HMODULE g_hWrapperModule = NULL;
 
 HMODULE d3d9dll = NULL;
+bool bChainedToOriginal = false;   // true when d3d9dll is the game-specific wrapper, not System32
 
 bool bForceWindowedMode;
 bool bUsePrimaryMonitor;
@@ -407,8 +450,14 @@ static void MaybeTakeScreenshot(IDirect3DDevice9* dev)
 // whether the future "AO at depth-unbind" pass is viable) plus cumulative health counters.
 // Detailed lines for the 10 frames after the scene depth texture first appears, then one
 // summary line every 1800 presents so a long session stays readable.
+// Frames presented so far; logged at each loss and return of focus, it tells a game that
+// kept running while unfocused from one that froze (a screenshot comparison cannot: a still
+// scene looks frozen).
+volatile LONG g_presentCount = 0;
+
 static void PresentDiagTick()
 {
+	InterlockedIncrement(&g_presentCount);
 	static unsigned s_frame = 0;
 	static unsigned s_winBinds = 0, s_winNull = 0, s_winSceneBB = 0;
 	static int s_detail = 0;
@@ -1484,10 +1533,10 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 
 		// Open log file next to this DLL
 		{
-			char logPath[MAX_PATH];
-			GetModuleFileNameA(hModule, logPath, MAX_PATH);
-			strcpy(strrchr(logPath, '\\'), "\\d3d9_wrapper.log");
-			g_log = fopen(logPath, "w");
+			InitializeCriticalSection(&g_logLock);
+			GetModuleFileNameA(hModule, g_logPath, MAX_PATH);
+			strcpy(strrchr(g_logPath, '\\'), "\\d3d9_wrapper.log");
+			g_log = fopen(g_logPath, "w");
 			WrapperLog("d3d9 wrapper loaded\n");
 		}
 
@@ -1506,6 +1555,7 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 		}
 		else
 		{
+			bChainedToOriginal = true;
 			WrapperLog("Loaded: %s\n", path);
 		}
 
@@ -1537,7 +1587,7 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 			// display scaling (e.g. 160% on a 1440p laptop screen) makes the borderless window
 			// undersized-then-DWM-stretched (extra blur) and lies to GetMonitorInfo about the
 			// desktop size. Must run at DLL attach — the game's window doesn't exist yet.
-			if (GetPrivateProfileInt("MAIN", "DPIAware", 1, path) != 0)
+			if (IniInt(INI_WINDOW, "MAIN", "DPIAware", 1, path) != 0)
 			{
 				typedef BOOL(WINAPI* SetDpiCtx_fn)(HANDLE);
 				HMODULE user32 = GetModuleHandleA("user32.dll");
@@ -1550,46 +1600,46 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 				WrapperLog("DPIAware: %s\n", dpiOk ? "enabled (DPI virtualization off)" : "FAILED");
 			}
 
-			bForceWindowedMode = GetPrivateProfileInt("MAIN", "ForceWindowedMode", 0, path) != 0;
-			fFPSLimit = static_cast<float>(GetPrivateProfileInt("MAIN", "FPSLimit", 0, path));
-			nFullScreenRefreshRateInHz = GetPrivateProfileInt("MAIN", "FullScreenRefreshRateInHz", 0, path);
-			bDisplayFPSCounter = GetPrivateProfileInt("MAIN", "DisplayFPSCounter", 0, path);
-			nScreenshotKey = GetPrivateProfileInt("MAIN", "ScreenshotKey", VK_F12, path);
-			bEnableHooks = GetPrivateProfileInt("MAIN", "EnableHooks", 0, path);
-			bUsePrimaryMonitor = GetPrivateProfileInt("FORCEWINDOWED", "UsePrimaryMonitor", 0, path) != 0;
-			bCenterWindow = GetPrivateProfileInt("FORCEWINDOWED", "CenterWindow", 1, path) != 0;
-			bAlwaysOnTop = GetPrivateProfileInt("FORCEWINDOWED", "AlwaysOnTop", 0, path) != 0;
-			bDoNotNotifyOnTaskSwitch = GetPrivateProfileInt("FORCEWINDOWED", "DoNotNotifyOnTaskSwitch", 0, path) != 0;
-			nForceWindowStyle = GetPrivateProfileInt("FORCEWINDOWED", "ForceWindowStyle", 0, path);
-			bCaptureMouse = GetPrivateProfileInt("FORCEWINDOWED", "CaptureMouse", 0, path) != 0;
-			bFreeMouse = GetPrivateProfileInt("FORCEWINDOWED", "FreeMouse", 1, path) != 0;
-			nAntialiasing = GetPrivateProfileInt("GRAPHICS", "Antialiasing", 0, path);
-			nAnisotropicFiltering = GetPrivateProfileInt("GRAPHICS", "AnisotropicFiltering", 0, path);
-			bVSync = GetPrivateProfileInt("GRAPHICS", "VSync", 0, path) != 0;
-			bFXAA = GetPrivateProfileInt("GRAPHICS", "FXAA", 0, path) != 0;
+			bForceWindowedMode = GetPrivateProfileInt(INI_SHARED_MAIN, "ForceWindowedMode", 0, path) != 0;
+			fFPSLimit = static_cast<float>(IniInt(INI_WINDOW, "MAIN", "FPSLimit", 0, path));
+			nFullScreenRefreshRateInHz = IniInt(INI_WINDOW, "MAIN", "FullScreenRefreshRateInHz", 0, path);
+			bDisplayFPSCounter = IniInt(INI_WINDOW, "MAIN", "DisplayFPSCounter", 0, path);
+			nScreenshotKey = IniInt(INI_WINDOW, "MAIN", "ScreenshotKey", VK_F12, path);
+			bEnableHooks = IniInt(INI_WINDOW, "MAIN", "EnableHooks", 0, path);
+			bUsePrimaryMonitor = GetPrivateProfileInt(INI_SHARED_WINDOW, "UsePrimaryMonitor", 0, path) != 0;
+			bCenterWindow = GetPrivateProfileInt(INI_SHARED_WINDOW, "CenterWindow", 1, path) != 0;
+			bAlwaysOnTop = GetPrivateProfileInt(INI_SHARED_WINDOW, "AlwaysOnTop", 0, path) != 0;
+			bDoNotNotifyOnTaskSwitch = GetPrivateProfileInt(INI_SHARED_WINDOW, "DoNotNotifyOnTaskSwitch", 0, path) != 0;
+			nForceWindowStyle = GetPrivateProfileInt(INI_SHARED_WINDOW, "ForceWindowStyle", 0, path);
+			bCaptureMouse = IniInt(INI_WINDOW, "FORCEWINDOWED", "CaptureMouse", 0, path) != 0;
+			bFreeMouse = IniInt(INI_WINDOW, "FORCEWINDOWED", "FreeMouse", 1, path) != 0;
+			nAntialiasing = IniInt(INI_GRAPHICS, "GRAPHICS", "Antialiasing", 0, path);
+			nAnisotropicFiltering = IniInt(INI_GRAPHICS, "GRAPHICS", "AnisotropicFiltering", 0, path);
+			bVSync = IniInt(INI_GRAPHICS, "GRAPHICS", "VSync", 0, path) != 0;
+			bFXAA = IniInt(INI_GRAPHICS, "GRAPHICS", "FXAA", 0, path) != 0;
 			{
 				char szBias[32];
-				GetPrivateProfileStringA("GRAPHICS", "TextureLODBias", "0", szBias, sizeof(szBias), path);
+				IniString(INI_GRAPHICS, "GRAPHICS", "TextureLODBias", "0", szBias, sizeof(szBias), path);
 				fTextureLODBias = static_cast<float>(atof(szBias));
 			}
-			nSSAAFactor = GetPrivateProfileInt("GRAPHICS", "SSAAFactor", 1, path);
+			nSSAAFactor = IniInt(INI_GRAPHICS, "GRAPHICS", "SSAAFactor", 1, path);
 			if (nSSAAFactor < 1) nSSAAFactor = 1;
 			if (nSSAAFactor > 4) nSSAAFactor = 4;
-			nShadowMapScale = GetPrivateProfileInt("GRAPHICS", "ShadowMapScale", 1, path);
+			nShadowMapScale = IniInt(INI_GRAPHICS, "GRAPHICS", "ShadowMapScale", 1, path);
 			if (nShadowMapScale < 1) nShadowMapScale = 1;
 			if (nShadowMapScale > 8) nShadowMapScale = 8;
-			bColorGrading = GetPrivateProfileInt("GRAPHICS", "ColorGrading", 1, path) != 0;
+			bColorGrading = IniInt(INI_GRAPHICS, "GRAPHICS", "ColorGrading", 1, path) != 0;
 			{
 				char szF[32];
-				GetPrivateProfileStringA("GRAPHICS", "Vibrance",  "0.15", szF, sizeof(szF), path); fVibrance = (float)atof(szF);
-				GetPrivateProfileStringA("GRAPHICS", "Vignette",  "0.40", szF, sizeof(szF), path); fVignette = (float)atof(szF);
-				GetPrivateProfileStringA("GRAPHICS", "Lift",      "0.00", szF, sizeof(szF), path); fLift     = (float)atof(szF);
-				GetPrivateProfileStringA("GRAPHICS", "Gamma",     "1.00", szF, sizeof(szF), path); fGamma    = (float)atof(szF);
-				GetPrivateProfileStringA("GRAPHICS", "Gain",      "1.05", szF, sizeof(szF), path); fGain     = (float)atof(szF);
-					GetPrivateProfileStringA("GRAPHICS", "Temperature", "0.00", szF, sizeof(szF), path); fTemperature = (float)atof(szF);
-					GetPrivateProfileStringA("GRAPHICS", "Tint",        "0.00", szF, sizeof(szF), path); fTint        = (float)atof(szF);
-					GetPrivateProfileStringA("GRAPHICS", "Contrast",    "0.00", szF, sizeof(szF), path); fContrast    = (float)atof(szF);
-					GetPrivateProfileStringA("GRAPHICS", "SplitTone",   "0.00", szF, sizeof(szF), path); fSplitTone   = (float)atof(szF);
+				IniString(INI_GRAPHICS, "GRAPHICS", "Vibrance",  "0.15", szF, sizeof(szF), path); fVibrance = (float)atof(szF);
+				IniString(INI_GRAPHICS, "GRAPHICS", "Vignette",  "0.40", szF, sizeof(szF), path); fVignette = (float)atof(szF);
+				IniString(INI_GRAPHICS, "GRAPHICS", "Lift",      "0.00", szF, sizeof(szF), path); fLift     = (float)atof(szF);
+				IniString(INI_GRAPHICS, "GRAPHICS", "Gamma",     "1.00", szF, sizeof(szF), path); fGamma    = (float)atof(szF);
+				IniString(INI_GRAPHICS, "GRAPHICS", "Gain",      "1.05", szF, sizeof(szF), path); fGain     = (float)atof(szF);
+					IniString(INI_GRAPHICS, "GRAPHICS", "Temperature", "0.00", szF, sizeof(szF), path); fTemperature = (float)atof(szF);
+					IniString(INI_GRAPHICS, "GRAPHICS", "Tint",        "0.00", szF, sizeof(szF), path); fTint        = (float)atof(szF);
+					IniString(INI_GRAPHICS, "GRAPHICS", "Contrast",    "0.00", szF, sizeof(szF), path); fContrast    = (float)atof(szF);
+					IniString(INI_GRAPHICS, "GRAPHICS", "SplitTone",   "0.00", szF, sizeof(szF), path); fSplitTone   = (float)atof(szF);
 					if (fTemperature < -1.0f) fTemperature = -1.0f;
 					if (fTemperature >  1.0f) fTemperature =  1.0f;
 					if (fTint < -1.0f) fTint = -1.0f;
@@ -1598,30 +1648,30 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 					if (fContrast > 1.0f) fContrast = 1.0f;
 					if (fSplitTone < 0.0f) fSplitTone = 0.0f;
 					if (fSplitTone > 1.0f) fSplitTone = 1.0f;
-					GetPrivateProfileStringA("GRAPHICS", "Sharpness", "0.40", szF, sizeof(szF), path); fSharpness = (float)atof(szF);
+					IniString(INI_GRAPHICS, "GRAPHICS", "Sharpness", "0.40", szF, sizeof(szF), path); fSharpness = (float)atof(szF);
 					if (fSharpness < 0.0f) fSharpness = 0.0f;
 					if (fSharpness > 1.0f) fSharpness = 1.0f;
 			}
-			bSSAO = GetPrivateProfileInt("GRAPHICS", "SSAO", 0, path) != 0;
+			bSSAO = IniInt(INI_GRAPHICS, "GRAPHICS", "SSAO", 0, path) != 0;
 			{
 				char szF[32];
-				GetPrivateProfileStringA("GRAPHICS", "SSAOStrength", "0.50", szF, sizeof(szF), path); fSSAOStrength = (float)atof(szF);
-				GetPrivateProfileStringA("GRAPHICS", "SSAORadius",   "6.0",  szF, sizeof(szF), path); fSSAORadius   = (float)atof(szF);
-				GetPrivateProfileStringA("GRAPHICS", "SSAOMinDelta", "0.0005", szF, sizeof(szF), path); fSSAOMinDelta = (float)atof(szF);
-				GetPrivateProfileStringA("GRAPHICS", "SSAOMaxDelta", "0.05",   szF, sizeof(szF), path); fSSAOMaxDelta = (float)atof(szF);
-					bBloom = GetPrivateProfileInt("GRAPHICS", "Bloom", 0, path) != 0;
-					bGodRays = GetPrivateProfileInt("GRAPHICS", "GodRays", 0, path) != 0;
-					GetPrivateProfileStringA("GRAPHICS", "BloomStrength",   "0.35", szF, sizeof(szF), path); fBloomStrength   = (float)atof(szF);
-					GetPrivateProfileStringA("GRAPHICS", "BloomThreshold",  "0.75", szF, sizeof(szF), path); fBloomThreshold  = (float)atof(szF);
-					GetPrivateProfileStringA("GRAPHICS", "GodRaysStrength", "0.45", szF, sizeof(szF), path); fGodRaysStrength = (float)atof(szF);
-					GetPrivateProfileStringA("GRAPHICS", "GodRaysDecay",    "0.96", szF, sizeof(szF), path); fGodRaysDecay    = (float)atof(szF);
+				IniString(INI_GRAPHICS, "GRAPHICS", "SSAOStrength", "0.50", szF, sizeof(szF), path); fSSAOStrength = (float)atof(szF);
+				IniString(INI_GRAPHICS, "GRAPHICS", "SSAORadius",   "6.0",  szF, sizeof(szF), path); fSSAORadius   = (float)atof(szF);
+				IniString(INI_GRAPHICS, "GRAPHICS", "SSAOMinDelta", "0.0005", szF, sizeof(szF), path); fSSAOMinDelta = (float)atof(szF);
+				IniString(INI_GRAPHICS, "GRAPHICS", "SSAOMaxDelta", "0.05",   szF, sizeof(szF), path); fSSAOMaxDelta = (float)atof(szF);
+					bBloom = IniInt(INI_GRAPHICS, "GRAPHICS", "Bloom", 0, path) != 0;
+					bGodRays = IniInt(INI_GRAPHICS, "GRAPHICS", "GodRays", 0, path) != 0;
+					IniString(INI_GRAPHICS, "GRAPHICS", "BloomStrength",   "0.35", szF, sizeof(szF), path); fBloomStrength   = (float)atof(szF);
+					IniString(INI_GRAPHICS, "GRAPHICS", "BloomThreshold",  "0.75", szF, sizeof(szF), path); fBloomThreshold  = (float)atof(szF);
+					IniString(INI_GRAPHICS, "GRAPHICS", "GodRaysStrength", "0.45", szF, sizeof(szF), path); fGodRaysStrength = (float)atof(szF);
+					IniString(INI_GRAPHICS, "GRAPHICS", "GodRaysDecay",    "0.96", szF, sizeof(szF), path); fGodRaysDecay    = (float)atof(szF);
 					if (fBloomThreshold < 0.0f) fBloomThreshold = 0.0f;
 					if (fBloomThreshold > 1.0f) fBloomThreshold = 1.0f;
 					if (fGodRaysDecay < 0.80f) fGodRaysDecay = 0.80f;
 					if (fGodRaysDecay > 0.999f) fGodRaysDecay = 0.999f;
 			}
-			nResolutionWidth = GetPrivateProfileInt("RESOLUTION", "Width", 0, path);
-			nResolutionHeight = GetPrivateProfileInt("RESOLUTION", "Height", 0, path);
+			nResolutionWidth = GetPrivateProfileInt(INI_GRAPHICS, "RenderWidth", 0, path);
+			nResolutionHeight = GetPrivateProfileInt(INI_GRAPHICS, "RenderHeight", 0, path);
 
 			WrapperLog("Ini: %s\n", path);
 			WrapperLog("  ForceWindowedMode=%d ForceWindowStyle=%d EnableHooks=%d DoNotNotify=%d\n",
@@ -1639,7 +1689,7 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 			if (fFPSLimit > 0.0f)
 			{
 				// Default matches data/d3d9.ini: ACCURATE (sleep-yield). REALTIME busy-waits a full core.
-				FrameLimiter::FPSLimitMode mode = (GetPrivateProfileInt("MAIN", "FPSLimitMode", 2, path) == 1) ? FrameLimiter::FPSLimitMode::FPS_REALTIME : FrameLimiter::FPSLimitMode::FPS_ACCURATE;
+				FrameLimiter::FPSLimitMode mode = (IniInt(INI_WINDOW, "MAIN", "FPSLimitMode", 2, path) == 1) ? FrameLimiter::FPSLimitMode::FPS_REALTIME : FrameLimiter::FPSLimitMode::FPS_ACCURATE;
 				if (mode == FrameLimiter::FPSLimitMode::FPS_ACCURATE)
 					timeBeginPeriod(1);
 
@@ -1653,15 +1703,28 @@ bool WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 
 			if (bFreeMouse && !bCaptureMouse)
 			{
-				HMODULE mainModule = GetModuleHandleA(nullptr);
-				auto originals = IATHook::Replace(
-					mainModule, "user32.dll",
-					std::make_tuple("ClipCursor", (void*)hk_ClipCursor),
-					std::make_tuple("SetCapture", (void*)hk_SetCapture)
-				);
-				if (oClipCursor == NULL) { auto it = originals.find("ClipCursor"); if (it != originals.end()) oClipCursor = (ClipCursor_fn)it->second.get(); }
-				if (oSetCapture == NULL) { auto it = originals.find("SetCapture"); if (it != originals.end()) oSetCapture = (SetCapture_fn)it->second.get(); }
-				WrapperLog("FreeMouse hooks installed (ClipCursor=%p, SetCapture=%p)\n", oClipCursor, oSetCapture);
+				// The game executables import neither ClipCursor nor SetCapture (checked on HP4, HP5,
+				// HP6): the call that traps the cursor comes from the game-specific wrapper chained
+				// below us, d3d9_original.dll (traced with Frida: ClipCursor(whole monitor) during
+				// CreateDevice). Hooking the host exe alone installed nothing — the log read
+				// "ClipCursor=00000000". So the upstream wrapper's imports are patched too.
+				HMODULE targets[2] = { GetModuleHandleA(nullptr), bChainedToOriginal ? d3d9dll : nullptr };
+				const char* names[2] = { "host exe", "d3d9_original.dll" };
+				for (int i = 0; i < 2; i++)
+				{
+					if (!targets[i]) continue;
+					auto originals = IATHook::Replace(
+						targets[i], "user32.dll",
+						std::make_tuple("ClipCursor", (void*)hk_ClipCursor),
+						std::make_tuple("SetCapture", (void*)hk_SetCapture)
+					);
+					auto c = originals.find("ClipCursor");
+					auto s = originals.find("SetCapture");
+					if (oClipCursor == NULL && c != originals.end()) oClipCursor = (ClipCursor_fn)c->second.get();
+					if (oSetCapture == NULL && s != originals.end()) oSetCapture = (SetCapture_fn)s->second.get();
+					WrapperLog("FreeMouse: %s -> ClipCursor %s, SetCapture %s\n", names[i],
+						c != originals.end() ? "hooked" : "not imported", s != originals.end() ? "hooked" : "not imported");
+				}
 			}
 
 			InstallDirectInputHook();

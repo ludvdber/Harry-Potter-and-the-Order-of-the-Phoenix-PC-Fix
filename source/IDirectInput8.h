@@ -17,12 +17,24 @@ void InstallDirectInputHook();
 // re-Acquire on. Users have to relaunch the game to recover keyboard input after Alt+Tab.
 void DirectInputReAcquireMice();
 
+// Generation counter bumped every time the host process comes back to the foreground.
+// Detected by POLLING GetForegroundWindow from inside the device reads, not from window
+// messages: after the first activation the game window never receives WM_ACTIVATE /
+// WM_ACTIVATEAPP / WM_SETFOCUS again (measured on HP5 and HP6), so a message hook cannot
+// fire. Each wrapped device remembers the generation it last saw and does a single
+// Unacquire+Acquire when it changes, which clears DirectInput's "ghost acquired" state
+// (GetDeviceState keeps returning DI_OK with no key ever reported).
+LONG DirectInputForegroundGeneration();
+
 class m_IDirectInputDevice8A : public IDirectInputDevice8A
 {
 private:
 	LPDIRECTINPUTDEVICE8A ProxyInterface;
+	LONG SeenForegroundGeneration;
+	BYTE StaleKeys[256] = {};
+	bool ReAcquireIfForegroundReturned();
 public:
-	m_IDirectInputDevice8A(LPDIRECTINPUTDEVICE8A p) : ProxyInterface(p) {}
+	m_IDirectInputDevice8A(LPDIRECTINPUTDEVICE8A p) : ProxyInterface(p), SeenForegroundGeneration(DirectInputForegroundGeneration()) {}
 
 	STDMETHOD(QueryInterface)(REFIID riid, LPVOID* ppvObj);
 	STDMETHOD_(ULONG, AddRef)();
@@ -63,8 +75,11 @@ class m_IDirectInputDevice8W : public IDirectInputDevice8W
 {
 private:
 	LPDIRECTINPUTDEVICE8W ProxyInterface;
+	LONG SeenForegroundGeneration;
+	BYTE StaleKeys[256] = {};
+	bool ReAcquireIfForegroundReturned();
 public:
-	m_IDirectInputDevice8W(LPDIRECTINPUTDEVICE8W p) : ProxyInterface(p) {}
+	m_IDirectInputDevice8W(LPDIRECTINPUTDEVICE8W p) : ProxyInterface(p), SeenForegroundGeneration(DirectInputForegroundGeneration()) {}
 
 	STDMETHOD(QueryInterface)(REFIID riid, LPVOID* ppvObj);
 	STDMETHOD_(ULONG, AddRef)();
