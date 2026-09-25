@@ -1,5 +1,12 @@
 # Harry Potter and the Order of the Phoenix — Enhanced PC Fix
 
+> [!IMPORTANT]
+> **This repository is archived and no longer updated.** The fix now lives in
+> **[Harry-Potter-PC-Fix](https://github.com/ludvdber/Harry-Potter-PC-Fix)**: one rewritten `d3d9.dll`
+> for *Goblet of Fire*, *Order of the Phoenix* and *Half-Blood Prince*, with every setting in `d3d9.ini`.
+> Players of [Accio Launcher](https://acciolauncher.be/) get it with the game and have nothing to do.
+> The text below describes the last version published here.
+
 ![hp5](https://github.com/user-attachments/assets/d18c2a80-bd34-463b-b372-4d20f4a19b30)
 
 An enhanced **Direct3D 9 wrapper** for *Harry Potter and the Order of the Phoenix* (EA Bright Light, 2007). Drops in as `d3d9.dll` next to `hp.exe` and layers modern visual quality on top of the 2007 renderer: real MSAA with auto-fallback, forced anisotropic filtering, automatic mipmap regeneration, FXAA + tunable adaptive sharpening, screen-space ambient occlusion, a bloom + god-rays lighting pass, and a full color grade (white balance, contrast, split toning) — plus a clean fix for the Alt+Tab freeze the game has shipped with since launch.
